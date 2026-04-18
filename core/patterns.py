@@ -143,7 +143,7 @@ REGEX_PATTERNS = {
         r"(?<!\d)[3-9]\d{15,18}(?!\d)"
     ),
     "PASSPORT": re.compile(
-        r"(?<![A-Z0-9])[EGD]\d{8}(?![A-Z0-9])"
+        r"(?<![A-Z0-9])[EGDPS]\d{8}(?![A-Z0-9])" # [修改] 添加了 P 和 S 护照类型，防止漏报
     ),
     "MILITARY_ID": re.compile(
         r"军字第\s*\d{4,8}\s*号"
@@ -169,7 +169,7 @@ REGEX_PATTERNS = {
         r"(?<![A-Z0-9])[0-9A-NP-Y][0-9A-Z]\d{6}[0-9A-Z]{9}[0-9A-Z](?![A-Z0-9])"
     ),
     "BUSINESS_LICENSE_NO": re.compile(
-        r"(?<!\d)4[34]\d{13}(?!\d)"
+        r"(?<!\d)[1-9]\d{14}(?!\d)" # [修改] 拓宽营业执照匹配范围，不仅限43/44开头
     ),
     # 社保号：省份汉字 + 2大写字母 + 8位数字，共11位
     "SOCIAL_SECURITY_NO": re.compile(
@@ -196,7 +196,7 @@ REGEX_PATTERNS = {
     ),
     "PASSWORD_OR_SECRET": re.compile(
         r"(?:\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}|sk-[A-Za-z0-9]{20,}|"
-        r"(?:password|passwd|secret|token|key)\s*[=:]\s*\S+)",
+        r"(?:password|passwd|pwd|secret|token|api_key|apikey|key)\s*[=:]\s*([a-zA-Z0-9_@#$%^&*\-!]+))", # [修改] 增加了 () 捕获组提取实际密码值
         re.IGNORECASE,
     ),
 }
@@ -279,7 +279,15 @@ def extract_sensitive_from_value(value_str: str) -> list:
         if not overlap and validate_luhn(m.group()):
             _add("BANK_CARD", m.group())
 
-    skip_types = {"ID_CARD", "USCC", "BANK_CARD", "CHINESE_NAME", "ADDRESS", "BUSINESS_LICENSE_NO"}
+    # [新增] 专门处理密码和密钥，利用正则的捕获组仅提取明文值，防止误报 "password="
+    for m in REGEX_PATTERNS["PASSWORD_OR_SECRET"].finditer(value_str):
+        # 如果有括号捕获组（也就是匹配到了 password=xxx），提取括号里的内容 group(1)
+        # 如果没有（匹配到的是 bcrypt 或 sk- 密钥），直接提取全串 group(0)
+        val = m.group(1) if m.lastindex else m.group()
+        _add("PASSWORD_OR_SECRET", val)
+
+    # [修改] 将 PASSWORD_OR_SECRET 加入 skip_types，因为上面已经单独处理过了
+    skip_types = {"ID_CARD", "USCC", "BANK_CARD", "CHINESE_NAME", "ADDRESS", "BUSINESS_LICENSE_NO", "PASSWORD_OR_SECRET"}
     for stype, pattern in REGEX_PATTERNS.items():
         if stype in skip_types:
             continue
