@@ -54,6 +54,13 @@ def _make_key(row: dict) -> tuple:
 
 # ── 核心评分 ─────────────────────────────────────────────────────
 def score(answer_rows: list, pred_rows: list) -> dict:
+    # [新增] 提取所有答案的定位 Key：(db_name, table_name, record_id)，用于锁定测试范围
+    # [新增] 只有在这些特定行里扫描出的数据，才会被拿来计算 F1，防止全库扫描导致 FP 爆炸
+    valid_loc_keys = set(
+        (row.get("db_name", "").strip(), row.get("table_name", "").strip(), row.get("record_id", "").strip())
+        for row in answer_rows
+    )
+
     # 按 data_form 分组的答案集合（允许重复行，但用 set 去重）
     answer_by_form: dict[str, set] = defaultdict(set)
     answer_level:   dict[tuple, str] = {}   # key -> correct level
@@ -67,6 +74,13 @@ def score(answer_rows: list, pred_rows: list) -> dict:
     pred_by_form: dict[str, set] = defaultdict(set)
     pred_level:   dict[tuple, str] = {}
     for row in pred_rows:
+        # [新增] 构建当前预测行的定位 Key
+        current_loc = (row.get("db_name", "").strip(), row.get("table_name", "").strip(), row.get("record_id", "").strip())
+        
+        # [新增] 如果这行数据不在 example.csv 的范围内，直接跳过，不计入 FP！
+        if current_loc not in valid_loc_keys:
+            continue
+
         key  = _make_key(row)
         form = row.get(FORM_COL, "")
         pred_by_form[form].add(key)
@@ -168,7 +182,18 @@ def print_report(result: dict):
 def print_diff(answer_rows: list, pred_rows: list, form_filter: str = None):
     """打印具体的 FP/FN 行，方便 debug 正则。"""
     answer_keys = {_make_key(r): r for r in answer_rows}
-    pred_keys   = {_make_key(r): r for r in pred_rows}
+    
+    # [新增] 同样需要限制打印 diff 时的测试范围，防止被全库的 FP 刷屏
+    valid_loc_keys = set(
+        (row.get("db_name", "").strip(), row.get("table_name", "").strip(), row.get("record_id", "").strip())
+        for row in answer_rows
+    )
+
+    pred_keys = {}
+    for r in pred_rows:
+        current_loc = (r.get("db_name", "").strip(), r.get("table_name", "").strip(), r.get("record_id", "").strip())
+        if current_loc in valid_loc_keys:
+            pred_keys[_make_key(r)] = r
 
     fn_keys = set(answer_keys) - set(pred_keys)
     fp_keys = set(pred_keys) - set(answer_keys)
