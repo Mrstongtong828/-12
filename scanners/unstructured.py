@@ -11,6 +11,8 @@ from core.patterns import (
     extract_sensitive_from_value, _SURNAMES_SET, COMPOUND_SURNAMES, NAME_BLACKLIST,
     _NAME_BLACKLIST_RE, _NAME_ADDR_CHARS,
     is_valid_address,              # [新增]
+    is_name_fp_field,              # [FP-fix P0-A]
+    is_job_title_name,             # [FP-fix P0-B]
 )
 from core.config import SENSITIVE_LEVEL_MAP
 from core.task_queue import ai_inference_slot
@@ -120,6 +122,9 @@ def _scan_chinese_names(text: str) -> list:
         # [fix] 混入地址/机构用字 → 不是人名（防 '东门街道' '家庄市石'）
         if any(c in _NAME_ADDR_CHARS for c in name):
             continue
+        # [FP-fix P0-B] 职务/称谓后缀（王审计员/张警官/xxx先生）
+        if is_job_title_name(name):
+            continue
 
         is_surname_match = False
         # 单字姓
@@ -195,12 +200,28 @@ def _run_uie(text: str) -> list:
     return results
 
 
-def _post_filter(findings: list, text: str) -> list:
-    """过滤非结构化文本中 IP_ADDRESS 和 EMAIL 的误报。"""
+def _post_filter(findings: list, text: str, field_name: str = None) -> list:
+    """
+    过滤非结构化文本的 FP。统一在这里做，覆盖所有上游路径：
+      - [FP-fix P0-A] 字段黑名单：CHINESE_NAME 跳过
+      - [FP-fix P0-B] 职务/称谓后缀：CHINESE_NAME 跳过（UIE/正则/姓氏扫描三路都能兜住）
+      - 原有：IP_ADDRESS 剔除紧跟 /数字或 :数字 的版本/端口/CIDR
+      - 原有：EMAIL 剔除无合法 TLD 的
+    """
     result = []
+    field_blacklisted = bool(field_name) and is_name_fp_field(field_name)
     for f in findings:
         stype = f.get("sensitive_type")
         val = f.get("extracted_value", "")
+
+        if stype == "CHINESE_NAME":
+            # [FP-fix P0-A] 字段在 FP 黑名单 → 所有中文名全部丢
+            if field_blacklisted:
+                continue
+            # [FP-fix P0-B] 称谓型名字（兜底 UIE 可能返回的 "王审计员"）
+            if is_job_title_name(val):
+                continue
+
         if stype == "IP_ADDRESS":
             # 在原文中定位该值，检查其后是否紧跟 /数字 或 :数字（版本号/端口/CIDR）
             idx = text.find(val)
@@ -250,5 +271,5 @@ def scan_unstructured_field(field_name, value_str, record_id,
     for stype, val in _run_uie(value_str):
         _add(stype, val)
 
-    findings = _post_filter(findings, value_str)
+    findings = _post_filter(findings, value_str, field_name=field_name)
     return findings

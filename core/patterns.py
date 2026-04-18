@@ -54,6 +54,48 @@ _NAME_ADDR_CHARS = frozenset(
     "局院厅局部处司委办站场库所馆组"
 )
 
+# ── [FP-fix P0-A] 字段名黑名单 ─────────────────────────────────────
+# 这些列里出现的"中文名"几乎全是职务占位符（张警官/王审计员/李专员），
+# 不是真实个人敏感信息。证据：example.csv 里这些字段没有任何命中，
+# 但 upload.csv 里贡献了 2700+ 条 CHINESE_NAME FP。
+NAME_FP_FIELD_BLACKLIST = frozenset({
+    "handler", "operator", "created_by", "updated_by", "modified_by",
+    "service_type", "role_name", "role", "user_role",
+    "reviewer", "approver", "auditor",
+    "assigned_to", "assignee", "processor",
+})
+
+
+def is_name_fp_field(field_name: str) -> bool:
+    """字段名是否在"人名占位符"黑名单里。"""
+    if not field_name:
+        return False
+    return field_name.lower() in NAME_FP_FIELD_BLACKLIST
+
+
+# ── [FP-fix P0-B] 职务/称谓后缀黑名单 ─────────────────────────────
+# 名字以这些结尾几乎 100% 是 FP：
+#   - 职务型："王审计员" / "张警官" / "李专员"
+#   - 称谓型："xxx先生" / "xxx女士"
+NAME_JOB_SUFFIXES = (
+    # 警务/司法
+    "警官", "警察", "干警", "法官", "检察官", "所长",
+    # 行政
+    "审计员", "专员", "经理", "主任", "科长", "处长", "部长",
+    "院长", "厅长", "局长", "书记", "干部", "员工", "师傅",
+    # 医疗/教育
+    "医生", "护士", "大夫", "老师", "教授", "博士", "研究员",
+    # 称谓
+    "先生", "女士", "同志",
+)
+
+
+def is_job_title_name(name: str) -> bool:
+    """名字是否以职务/称谓后缀结尾。"""
+    if not name:
+        return False
+    return any(name.endswith(suf) for suf in NAME_JOB_SUFFIXES)
+
 FIELD_NAME_DICT = {
     "CHINESE_NAME": [
         r"\breal_name\b", r"\btrue_name\b", r"\bcustomer_name\b", r"\buser_name\b",
@@ -396,6 +438,9 @@ def extract_sensitive_from_value(value_str: str) -> list:
             continue
         # [fix] 名字里混入地址/机构用字 → 大概率是从地址/文本里误切的片段
         if any(c in _NAME_ADDR_CHARS for c in name):
+            continue
+        # [FP-fix P0-B] 职务/称谓后缀（王审计员/张警官/xxx先生）
+        if is_job_title_name(name):
             continue
         if name[0] in _SURNAMES_SET:
             _add("CHINESE_NAME", name)

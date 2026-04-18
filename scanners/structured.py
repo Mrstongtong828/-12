@@ -6,6 +6,7 @@ from core.patterns import (
     extract_sensitive_from_value, match_field_name,
     extract_by_field_hint,
     is_valid_address,              # [新增]
+    is_name_fp_field,              # [FP-fix P0-A]
     _SURNAMES_SET, NAME_BLACKLIST, _FIELD_NAME_COMPILED, _NAME_BLACKLIST_RE,
 )
 from core.config import SENSITIVE_LEVEL_MAP
@@ -60,7 +61,11 @@ def scan_json_value(json_str, record_id, table_name, field_col_name, db_type, db
     except Exception:
         return findings
 
-    def _walk(obj):
+    def _walk(obj, parent_key=None):
+        # [FP-fix P0-A] 使用最近的父键作为有效字段名。
+        # 这样 ext_json 内部的 {"handler": "张警官"} 也能命中字段黑名单。
+        effective_field = parent_key if parent_key else field_col_name
+
         if isinstance(obj, str):
             actual = obj
             if _enc_check is not None and _enc_check(obj):
@@ -71,6 +76,9 @@ def scan_json_value(json_str, record_id, table_name, field_col_name, db_type, db
             if len(actual) > LEAF_TEXT_MAX_LEN:
                 actual = actual[:LEAF_TEXT_MAX_LEN]
             for stype, val in extract_sensitive_from_value(actual):
+                # [FP-fix P0-A] 父键是 FP 黑名单字段 → CHINESE_NAME 跳过
+                if stype == "CHINESE_NAME" and is_name_fp_field(effective_field):
+                    continue
                 findings.append(_make_finding(
                     db_type, db_name, table_name, field_col_name,
                     record_id, "semi_structured", stype, val,
@@ -79,6 +87,8 @@ def scan_json_value(json_str, record_id, table_name, field_col_name, db_type, db
             # [B1] JSON 数字类型（如 {"phone": 13800138000}）也需扫描
             s = str(int(obj)) if isinstance(obj, float) and obj == int(obj) else str(obj)
             for stype, val in extract_sensitive_from_value(s):
+                if stype == "CHINESE_NAME" and is_name_fp_field(effective_field):
+                    continue
                 findings.append(_make_finding(
                     db_type, db_name, table_name, field_col_name,
                     record_id, "semi_structured", stype, val,
@@ -91,10 +101,12 @@ def scan_json_value(json_str, record_id, table_name, field_col_name, db_type, db
                         record_id, "semi_structured", "PASSWORD_OR_SECRET", v,
                     ))
                 else:
-                    _walk(v)
+                    # 把 key 传给下一层，让叶子能感知父键
+                    _walk(v, parent_key=k)
         elif isinstance(obj, list):
             for item in obj:
-                _walk(item)
+                # 列表元素继承外层的 parent_key（列表本身没名字）
+                _walk(item, parent_key=parent_key)
 
     _walk(data)
     return findings
@@ -108,14 +120,20 @@ def scan_xml_value(xml_str, record_id, table_name, field_col_name, db_type, db_n
         return findings
 
     def _walk_elem(elem):
+        # [FP-fix P0-A] XML 的 tag 名等价于 JSON 的 key
+        tag_name = elem.tag if elem.tag else field_col_name
         if elem.text and elem.text.strip():
             for stype, val in extract_sensitive_from_value(elem.text.strip()):
+                if stype == "CHINESE_NAME" and is_name_fp_field(tag_name):
+                    continue
                 findings.append(_make_finding(
                     db_type, db_name, table_name, field_col_name,
                     record_id, "semi_structured", stype, val,
                 ))
-        for attr_val in elem.attrib.values():
+        for attr_name, attr_val in elem.attrib.items():
             for stype, val in extract_sensitive_from_value(attr_val):
+                if stype == "CHINESE_NAME" and is_name_fp_field(attr_name):
+                    continue
                 findings.append(_make_finding(
                     db_type, db_name, table_name, field_col_name,
                     record_id, "semi_structured", stype, val,
@@ -145,6 +163,10 @@ def _regex_fallback_scan(value_str, field_name, record_id, table_name,
 
     for stype, val in extract_sensitive_from_value(value_str):
         if stype == "CHINESE_NAME":
+            # [FP-fix P0-A] 字段在黑名单里（handler/operator/created_by 等）
+            # 直接跳过所有 CHINESE_NAME 候选
+            if is_name_fp_field(field_name):
+                continue
             if field_hints is None:
                 field_hints = match_field_name(field_name)
             if "CHINESE_NAME" not in field_hints:
