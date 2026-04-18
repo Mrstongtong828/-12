@@ -54,6 +54,49 @@ _NAME_ADDR_CHARS = frozenset(
     "局院厅局部处司委办站场库所馆组"
 )
 
+# ── [P0-C] ADDRESS 硬清洗 ─────────────────────────────────────────
+# 地址字段常见 label 前缀：extracted_value 若以这些开头，说明把 KV 文本整段吞了
+_ADDR_LABEL_PREFIXES = (
+    "家庭住址", "现住址", "联系地址", "通讯地址", "户籍地址", "居住地址",
+    "收货地址", "详细地址", "办公地址", "单位地址",
+    "地址", "住址", "住所", "家庭地址",
+    "address", "addr", "location", "home_address", "residence",
+)
+# 地址里不该出现的断句符（出现说明是一段文本，不是单一地址值）
+_ADDR_STOP_CHARS = frozenset("，。；！？\n\r\t、：:;\"'")
+
+# 地址合法结尾词（用于尾部校验）
+_ADDR_TAIL_WORDS = (
+    "号", "室", "栋", "楼", "弄", "巷", "组", "村", "院", "座", "单元",
+    "街", "路", "道", "里", "苑", "区", "厂", "所", "层",
+)
+
+# ── [P0-D] CHINESE_NAME 动词/病症字黑名单 ────────────────────────
+# 名字第 2 字起出现这些字几乎必然是 FP。
+# 覆盖：公积金提/高血压/家庭住/黄金贷/朱砂症...
+_NAME_VERB_CHARS = frozenset(
+    # 虚词/连词（长文本分词遗留）
+    "的了在是有和对与及或但也把被让使得从向到由于之所以因为如果"
+    # 动词
+    "提取查询申请办理登记发放缴纳支付购买出售转让抵押解除审批审核"
+    "办开关停付收发放转出入进退补退还"
+    # 病症/器官（"高血压"/"高血糖"/"肝炎"等）
+    "压症炎病疾患瘤癌肿烧疼痒痛晕喘"
+    "肝肺脾胃肾脑心血糖尿便汗尿"
+    # 金融/税务名词
+    "金款费税贷借息率额值账户单据证明"
+    # 物流/房产名词
+    "房车座站港店铺厅馆楼宅园"
+)
+
+
+def _is_verbish_name(name: str) -> bool:
+    """名字从第2字起含动词/病症/虚词 → 判为 FP。"""
+    if len(name) < 2:
+        return False
+    return any(c in _NAME_VERB_CHARS for c in name[1:])
+
+
 # ── [FP-fix P0-A] 字段名黑名单 ─────────────────────────────────────
 # 这些列里出现的"中文名"几乎全是职务占位符（张警官/王审计员/李专员），
 # 不是真实个人敏感信息。证据：example.csv 里这些字段没有任何命中，
@@ -442,6 +485,9 @@ def extract_sensitive_from_value(value_str: str) -> list:
         # [FP-fix P0-B] 职务/称谓后缀（王审计员/张警官/xxx先生）
         if is_job_title_name(name):
             continue
+        # [P0-D] 动词/病症字黑名单（公积金提/高血压/家庭住等）
+        if _is_verbish_name(name):
+            continue
         if name[0] in _SURNAMES_SET:
             _add("CHINESE_NAME", name)
             continue
@@ -494,17 +540,34 @@ _ADDR_STREET_CHARS = frozenset("路街巷弄号栋楼室")
 def is_valid_address(val: str, strict: bool = True) -> bool:
     """
     ADDRESS 统一校验。
-    - strict=True（默认，用于 structured）: 长度 >=15 + 含行政单位 + 含街道词
-    - strict=False（用于 unstructured 长文本）: 长度 >=10 + 含行政单位 + 含街道词
-      放宽长度是因为长文本中地址常被分词打断
+    - strict=True（结构化字段）: 长度 >=15 + 含行政 + 含街道 + 无 label/句读 + 合法尾部
+    - strict=False（长文本）   : 长度 >=10 + 其余同上（放宽长度）
     """
     if not val:
         return False
+    v = val.strip()
+
+    # [P0-C-1] 整值以 label 开头 → 不是干净地址（如 "家庭住址:北京..."）
+    low = v.lower()
+    for p in _ADDR_LABEL_PREFIXES:
+        if low.startswith(p.lower()):
+            return False
+
+    # [P0-C-2] 含断句/换行符 → 是段落文本而非单一地址
+    if any(c in _ADDR_STOP_CHARS for c in v):
+        return False
+
+    # [P0-C-3] 尾部 6 字内必须出现合法地址收尾词
+    tail = v[-6:]
+    if not any(w in tail for w in _ADDR_TAIL_WORDS):
+        return False
+
+    # 原有校验：长度 + 行政单位 + 街道词
     min_len = 15 if strict else 10
-    if len(val) < min_len:
+    if len(v) < min_len:
         return False
-    if not any(c in _ADDR_ADMIN_CHARS for c in val):
+    if not any(c in _ADDR_ADMIN_CHARS for c in v):
         return False
-    if not any(c in _ADDR_STREET_CHARS for c in val):
+    if not any(c in _ADDR_STREET_CHARS for c in v):
         return False
     return True

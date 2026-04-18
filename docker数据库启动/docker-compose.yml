@@ -1,0 +1,25 @@
+version: '3.8'
+
+# DASCTF 2026 — 数据库敏感数据智能识别挑战赛
+# 启动命令：docker-compose up -d
+# 停止命令：docker-compose down
+
+services:
+
+  # MySQL 8.0 — 包含 ecommerce_db（电商）和 fintech_db（金融风控）
+  mysql:
+    image: dasctf-mysql-2026:latest
+    container_name: dasctf_mysql
+    ports:
+      - "3306:3306"
+    restart: unless-stopped
+
+  # PostgreSQL 15 — 包含 healthcare_db（医疗健康）和 govservice_db（政务服务）
+  postgres:
+    image: dasctf-postgres-2026:latest
+    container_name: dasctf_postgres
+    environment:
+      PGDATA: /opt/pgdata
+    ports:
+      - "5432:5432"
+    restart: unless-stopped

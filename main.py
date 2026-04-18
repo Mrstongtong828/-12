@@ -101,7 +101,7 @@ def _sampled_rows(conn, db_type: str, table_name: str, pk_col):
             print(f"[ERROR] 无 PK 抽样失败 {table_name}: {e}")
         return
 
-    # 有 PK：拿 MIN/MAX，按 ID 区间切三段
+    # 有 PK：拿 MIN/MAX，按 ID 区间切三段，并避免重复行
     try:
         quote = "`" if db_type == "mysql" else '"'
         tbl = f"{quote}{table_name}{quote}"
@@ -132,6 +132,7 @@ def _sampled_rows(conn, db_type: str, table_name: str, pk_col):
         ]
 
         seq = 0
+        collected_pks = set()  # [dedup-fix] 跟踪已收集的主键，避免重复
         for where_order in segments:
             sql = f"SELECT * FROM {tbl} WHERE {where_order} LIMIT {per_segment}"
             try:
@@ -143,6 +144,10 @@ def _sampled_rows(conn, db_type: str, table_name: str, pk_col):
                         seq += 1
                         r_dict = _fix_row_mojibake(dict(r))
                         pk_value = r_dict.get(pk_col, seq)
+                        # [dedup-fix] 有真实主键时检查重复
+                        if pk_col and pk_value in collected_pks:
+                            continue
+                        collected_pks.add(pk_value)
                         yield (pk_value, r_dict)
                 else:
                     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -152,6 +157,10 @@ def _sampled_rows(conn, db_type: str, table_name: str, pk_col):
                         seq += 1
                         r_dict = dict(r)
                         pk_value = r_dict.get(pk_col, seq)
+                        # [dedup-fix] 有真实主键时检查重复
+                        if pk_col and pk_value in collected_pks:
+                            continue
+                        collected_pks.add(pk_value)
                         yield (pk_value, r_dict)
             except Exception as e:
                 print(f"[ERROR] 分段抽样失败 {table_name}: {e}")
