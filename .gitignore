@@ -4,3 +4,11 @@ __pycache__/
 *.sql
 .env
 env/
+venv311/
+.claude/
+scan_error.log
+*.log
+docker数据库启动/*.tar.gz
+docker数据库启动/hs_err_*.log
+docker数据库启动/replay_*.log
+output/*.csv
