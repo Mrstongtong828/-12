@@ -12,8 +12,16 @@
 """
 import re
 
-from scanners.structured import scan_structured_field
-from scanners.encoded import scan_encoded_field, _is_encoded_value
+from scanners.structured import (
+    scan_structured_field,
+    scan_json_value,
+    scan_xml_value,
+)
+from scanners.encoded import (
+    scan_encoded_field,
+    _is_encoded_value,
+    try_base64_as_image,
+)
 from scanners.unstructured import scan_unstructured_field, is_unstructured_text
 from scanners.blob import scan_blob_field
 
@@ -66,30 +74,40 @@ def dispatch(field_name: str, value, record_id, table_name: str,
 
     # ── 1c. Base64 编码图片 → OCR ─────────────────────────────────────
     # [P1] 仅对无空格的长字符串尝试 base64 图片检测，减少热路径开销
-    from scanners.encoded import try_base64_as_image
     if 100 <= len(value_str) <= 10_000_000 and ' ' not in value_str and '\n' not in value_str:
         img_bytes = try_base64_as_image(value_str)
         if img_bytes is not None:
             return scan_blob_field(img_bytes, record_id, table_name, field_name, db_type, db_name)
 
     # ── 2. 密码/密钥字段名 → structured（整值即为敏感值）────────
-    if _PWD_FIELD_RE.search(field_name):
+    is_pwd_field = bool(_PWD_FIELD_RE.search(field_name))
+    if is_pwd_field:
         return scan_structured_field(field_name, value_str, record_id,
                                      table_name, field_name, db_type, db_name)
 
-    # ── 3. JSON → semi_structured ────────────────────────────────
+    # ── 3. JSON → semi_structured（直接调用 JSON 扫描器）──────────
     if _is_json_like(value_str):
+        hits = scan_json_value(value_str, record_id, table_name,
+                               field_name, db_type, db_name)
+        if hits:
+            return hits
+        # JSON 解析失败时，降级走结构化兜底（保持 data_form 正确由下游处理）
         return scan_structured_field(field_name, value_str, record_id,
                                      table_name, field_name, db_type, db_name)
 
-    # ── 4. XML → semi_structured ─────────────────────────────────
+    # ── 4. XML → semi_structured（直接调用 XML 扫描器）────────────
     if _is_xml_like(value_str):
+        hits = scan_xml_value(value_str, record_id, table_name,
+                              field_name, db_type, db_name)
+        if hits:
+            return hits
+        # XML 解析失败时，降级走结构化兜底
         return scan_structured_field(field_name, value_str, record_id,
                                      table_name, field_name, db_type, db_name)
 
     # ── 5. 编码字段 → encoded（递归解码链）──────────────────────
     #     排除：密码字段（已在步骤2处理）、纯数字串
-    if not _PWD_FIELD_RE.search(field_name) and _is_encoded_value(value_str):
+    if _is_encoded_value(value_str):
         hits = scan_encoded_field(field_name, value_str, record_id,
                                    table_name, field_name, db_type, db_name)
         if hits:
