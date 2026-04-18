@@ -5,6 +5,7 @@ import xml.etree.ElementTree as ET
 from core.patterns import (
     extract_sensitive_from_value, match_field_name,
     extract_by_field_hint,
+    is_valid_address,              # [新增]
     _SURNAMES_SET, NAME_BLACKLIST, _FIELD_NAME_COMPILED, _NAME_BLACKLIST_RE,
 )
 from core.config import SENSITIVE_LEVEL_MAP
@@ -20,10 +21,6 @@ PASSWORD_FIELD_KEYWORDS = {"password", "passwd", "pwd", "secret", "token",
                             "api_key", "apikey", "private_key", "secret_key",
                             "access_token", "auth_token", "refresh_token",
                             "credential"}
-
-# ADDRESS 兜底过滤用的字符集，模块级常量避免每次构建
-_ADDR_ADMIN_CHARS = frozenset("省市区县")
-_ADDR_STREET_CHARS = frozenset("路街巷弄号栋楼室")
 
 
 def _is_password_field(field_name: str) -> bool:
@@ -157,12 +154,8 @@ def _regex_fallback_scan(value_str, field_name, record_id, table_name,
                         and not _NAME_BLACKLIST_RE.search(val)):
                     continue
         elif stype == "ADDRESS":
-            # 长度 >=15，且同时含行政单位词和街道词
-            if len(val) < 15:
-                continue
-            if not any(c in _ADDR_ADMIN_CHARS for c in val):
-                continue
-            if not any(c in _ADDR_STREET_CHARS for c in val):
+            # [fix #8] 用统一函数，strict=True（结构化字段要求严格）
+            if not is_valid_address(val, strict=True):
                 continue
 
         findings.append(_make_finding(

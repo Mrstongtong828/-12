@@ -4,6 +4,65 @@ import psycopg2.extras
 from core.config import DB_CONFIGS
 
 
+_CJK_RANGE = ('\u4e00', '\u9fa5')
+
+# CP1252 专有字符 → 对应字节（补齐 latin-1 所缺的 0x80-0x9F 区间映射）
+_CP1252_EXTRA = {
+    '\u20ac': 0x80, '\u201a': 0x82, '\u0192': 0x83, '\u201e': 0x84,
+    '\u2026': 0x85, '\u2020': 0x86, '\u2021': 0x87, '\u02c6': 0x88,
+    '\u2030': 0x89, '\u0160': 0x8a, '\u2039': 0x8b, '\u0152': 0x8c,
+    '\u017d': 0x8e, '\u2018': 0x91, '\u2019': 0x92, '\u201c': 0x93,
+    '\u201d': 0x94, '\u2022': 0x95, '\u2013': 0x96, '\u2014': 0x97,
+    '\u02dc': 0x98, '\u2122': 0x99, '\u0161': 0x9a, '\u203a': 0x9b,
+    '\u0153': 0x9c, '\u017e': 0x9e, '\u0178': 0x9f,
+}
+
+
+def _mojibake_to_bytes(s: str):
+    """把 mojibake 字符串映射回它所来自的字节序列。
+    合并 Latin-1（覆盖 0x80-0x9F 控制字节）与 CP1252（覆盖 Š/…/œ 等专用字符）。
+    无法映射的字符返回 None。"""
+    out = bytearray()
+    for ch in s:
+        cp = ord(ch)
+        if cp < 0x100:
+            out.append(cp)
+        elif ch in _CP1252_EXTRA:
+            out.append(_CP1252_EXTRA[ch])
+        else:
+            return None
+    return bytes(out)
+
+
+def _fix_mysql_mojibake(s):
+    """
+    修复 MySQL 中因双重编码（原始 UTF-8 字节被误以 CP1252/Latin-1 解释后再以 UTF-8
+    写回列）而产生的 mojibake。典型特征：字符串含有 Ã/Â/è/å/Š 等 Latin-1 Supplement
+    或 CP1252 专有字符，用 cp1252 重新编码后能被 UTF-8 正确解码为中文。
+
+    只在重解码结果包含中文字符时才替换，避免破坏纯英文 / 本就正常的值。
+    """
+    if not isinstance(s, str) or not s:
+        return s
+    # 快速过滤：没有任何非 ASCII 字符时直接返回
+    if all(ord(ch) < 0x80 for ch in s):
+        return s
+    raw = _mojibake_to_bytes(s)
+    if raw is None:
+        return s
+    try:
+        fixed = raw.decode('utf-8', errors='strict')
+    except UnicodeDecodeError:
+        return s
+    if fixed != s and any(_CJK_RANGE[0] <= ch <= _CJK_RANGE[1] for ch in fixed):
+        return fixed
+    return s
+
+
+def _fix_row_mojibake(row: dict) -> dict:
+    return {k: _fix_mysql_mojibake(v) for k, v in row.items()}
+
+
 def get_connection(db_type: str, db_name: str):
     cfg = DB_CONFIGS.get(db_type)
     if cfg is None:
@@ -176,8 +235,9 @@ def stream_table_rows(conn, db_type: str, table_name: str, pk_col):
                         break
                     for row in rows:
                         row_num += 1
-                        pk_value = row.get(pk_col, row_num) if pk_col else row_num
-                        yield (pk_value, dict(row))
+                        fixed = _fix_row_mojibake(dict(row))
+                        pk_value = fixed.get(pk_col, row_num) if pk_col else row_num
+                        yield (pk_value, fixed)
         elif db_type == "postgresql":
             # [B6] 用 with 管理 cursor，确保生成器提前关闭（超时 break）时也能释放游标
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:

@@ -47,6 +47,13 @@ NAME_BLACKLIST = {
 # [P4] 预编译黑名单正则，替换 O(n) 子串循环
 _NAME_BLACKLIST_RE = re.compile("|".join(re.escape(w) for w in NAME_BLACKLIST))
 
+# 地址/机构常见字：出现任一即认为这段 2-4 字串不是人名（防止从地址文本里误切名字）
+# 例：'家庄市石' / '东门街道' / '宁市西乡' / '家乡1347' 等
+_NAME_ADDR_CHARS = frozenset(
+    "省市区县乡镇村街道路弄巷号栋楼室组院庄园区苑里"
+    "局院厅局部处司委办站场库所馆组"
+)
+
 FIELD_NAME_DICT = {
     "CHINESE_NAME": [
         r"\breal_name\b", r"\btrue_name\b", r"\bcustomer_name\b", r"\buser_name\b",
@@ -387,6 +394,9 @@ def extract_sensitive_from_value(value_str: str) -> list:
         name = m.group()
         if _NAME_BLACKLIST_RE.search(name):
             continue
+        # [fix] 名字里混入地址/机构用字 → 大概率是从地址/文本里误切的片段
+        if any(c in _NAME_ADDR_CHARS for c in name):
+            continue
         if name[0] in _SURNAMES_SET:
             _add("CHINESE_NAME", name)
             continue
@@ -429,3 +439,27 @@ def extract_by_field_hint(field_name: str, value_str: str) -> list:
             hits.append(("BUSINESS_LICENSE_NO", val))
 
     return hits
+
+
+# ADDRESS 统一校验（fix #8）
+_ADDR_ADMIN_CHARS = frozenset("省市区县")
+_ADDR_STREET_CHARS = frozenset("路街巷弄号栋楼室")
+
+
+def is_valid_address(val: str, strict: bool = True) -> bool:
+    """
+    ADDRESS 统一校验。
+    - strict=True（默认，用于 structured）: 长度 >=15 + 含行政单位 + 含街道词
+    - strict=False（用于 unstructured 长文本）: 长度 >=10 + 含行政单位 + 含街道词
+      放宽长度是因为长文本中地址常被分词打断
+    """
+    if not val:
+        return False
+    min_len = 15 if strict else 10
+    if len(val) < min_len:
+        return False
+    if not any(c in _ADDR_ADMIN_CHARS for c in val):
+        return False
+    if not any(c in _ADDR_STREET_CHARS for c in val):
+        return False
+    return True

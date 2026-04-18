@@ -12,6 +12,7 @@ from core.config import (
 )
 from core.db_connector import (
     get_connection, get_all_tables, get_primary_key_col, stream_table_rows,
+    _fix_row_mojibake,
 )
 from core.csv_writer import CSVWriter
 from core.dispatcher import dispatch
@@ -89,7 +90,7 @@ def _sampled_rows(conn, db_type: str, table_name: str, pk_col):
                     cur.execute(f"SELECT * FROM `{table_name}` LIMIT {SAMPLE_ROWS_PER_TABLE}")
                     rows = cur.fetchall()
                 for i, r in enumerate(rows, 1):
-                    yield (i, dict(r))
+                    yield (i, _fix_row_mojibake(dict(r)))
             else:
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute(f'SELECT * FROM "{table_name}" LIMIT {SAMPLE_ROWS_PER_TABLE}')
@@ -140,7 +141,7 @@ def _sampled_rows(conn, db_type: str, table_name: str, pk_col):
                         rows = cur.fetchall()
                     for r in rows:
                         seq += 1
-                        r_dict = dict(r)
+                        r_dict = _fix_row_mojibake(dict(r))
                         pk_value = r_dict.get(pk_col, seq)
                         yield (pk_value, r_dict)
                 else:

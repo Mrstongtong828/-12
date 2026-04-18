@@ -9,7 +9,8 @@
 import re
 from core.patterns import (
     extract_sensitive_from_value, _SURNAMES_SET, COMPOUND_SURNAMES, NAME_BLACKLIST,
-    _NAME_BLACKLIST_RE,
+    _NAME_BLACKLIST_RE, _NAME_ADDR_CHARS,
+    is_valid_address,              # [新增]
 )
 from core.config import SENSITIVE_LEVEL_MAP
 from core.task_queue import ai_inference_slot
@@ -116,6 +117,9 @@ def _scan_chinese_names(text: str) -> list:
         name = m.group()
         if _NAME_BLACKLIST_RE.search(name):
             continue
+        # [fix] 混入地址/机构用字 → 不是人名（防 '东门街道' '家庄市石'）
+        if any(c in _NAME_ADDR_CHARS for c in name):
+            continue
 
         is_surname_match = False
         # 单字姓
@@ -142,7 +146,12 @@ def _scan_chinese_names(text: str) -> list:
 
 
 def _scan_addresses(text: str) -> list:
-    return [("ADDRESS", m.group()) for m in _ADDRESS_RE.finditer(text) if len(m.group()) >= 10]
+    # [fix #8] 用统一校验，strict=False（长文本中地址常被分词打断，放宽长度到 10）
+    return [
+        ("ADDRESS", m.group())
+        for m in _ADDRESS_RE.finditer(text)
+        if is_valid_address(m.group(), strict=False)
+    ]
 
 
 # UIE schema 实体类型 → sensitive_type 映射
