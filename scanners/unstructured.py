@@ -3,22 +3,40 @@
 
 策略：
   1. 正则扫描（始终运行，速度快）
-  2. UIE NER（可选，模型存在时启用，结果与正则合并去重）
+  2. UIE NER（可选，由环境变量 UIE_ENABLED 开启，模型文件存在时才生效）
+     - 默认关闭：UIE 正确率/覆盖率不稳定，先跑正则基线
+     - UIE_AUDIT=1：UIE 结果不合并到 findings，只打日志供对比
+     - schema 已裁剪为只抽 4 种有结构先验的实体（手机/身份证/银行卡/邮箱）
+       人名/地址 UIE 易 FP 且正则+词典已经够好，不开
   UIE 不可用时自动降级为纯正则，不崩溃。
+
+启用方式：
+    export UIE_ENABLED=1               # 合并 UIE 结果
+    export UIE_ENABLED=1 UIE_AUDIT=1   # 审计模式：只打日志不合并
 """
+import os
 import re
+import logging
 from core.patterns import (
     extract_sensitive_from_value, _SURNAMES_SET, COMPOUND_SURNAMES, NAME_BLACKLIST,
     _NAME_BLACKLIST_RE, _NAME_ADDR_CHARS,
-    is_valid_address,              # [新增]
-    is_name_fp_field,              # [FP-fix P0-A]
-    is_job_title_name,             # [FP-fix P0-B]
+    is_valid_address,
+    is_name_fp_field,              # [P0-A]
+    is_job_title_name,             # [P0-B]
+    _is_verbish_name,              # [P0-D]
 )
 from core.config import SENSITIVE_LEVEL_MAP
 from core.task_queue import ai_inference_slot
 
 UIE_MODEL_DIR = "./models/paddlenlp/uie-base"
-UIE_MAX_CHUNK = 500  # UIE 单次最大输入字符数，防 OOM（fix P6）
+UIE_MAX_CHUNK = 500  # UIE 单次最大输入字符数，防 OOM
+
+# ── UIE 开关 ──────────────────────────────────────────────────────
+# 默认关。审计模式把 UIE 输出打到 scan_error.log 让你判断是否值得开。
+UIE_ENABLED = os.environ.get("UIE_ENABLED", "0") == "1"
+UIE_AUDIT   = os.environ.get("UIE_AUDIT", "0") == "1"
+
+_uie_logger = logging.getLogger("scan.uie")
 
 _uie_engine = None
 _uie_available = None  # None=未检测, True/False=检测结果
@@ -30,7 +48,6 @@ def get_uie_engine():
     if _uie_available is not None:
         return _uie_engine
 
-    import os
     if not os.path.isdir(UIE_MODEL_DIR) or not os.listdir(UIE_MODEL_DIR):
         _uie_available = False
         return None
@@ -39,7 +56,9 @@ def get_uie_engine():
         from paddlenlp import Taskflow
         _uie_engine = Taskflow(
             "information_extraction",
-            schema=["人名", "家庭住址", "手机号码", "身份证号", "银行卡号", "电子邮箱"],
+            # 裁剪后的 schema：只保留 4 种有结构先验的实体
+            # 人名 / 家庭住址 UIE 易 FP，正则+词典已经够好，不开
+            schema=["手机号码", "身份证号", "银行卡号", "电子邮箱"],
             model="uie-base",
             task_path=UIE_MODEL_DIR,
             use_gpu=False,
@@ -53,7 +72,7 @@ def get_uie_engine():
     return _uie_engine
 
 
-# 模块级预编译（fix P2/P3）
+# 模块级预编译
 _NAME_TRIGGER = re.compile(
     r"(?:叫|名叫|姓名|姓名为|名字|名为|联系人|负责人|经手人|申请人|代理人)"
 )
@@ -61,13 +80,13 @@ _ENCODED_HINT = re.compile(
     r"^[A-Za-z0-9+/=]{20,}$|%[0-9A-Fa-f]{2}|\\u[0-9a-fA-F]{4}"
 )
 _HAS_CHINESE = re.compile(r"[\u4e00-\u9fa5]")
-_HAS_NATURAL = re.compile(r"[\s，。！？、；：\u201c\u201d\u2018\u2019（）【】]")
+_HAS_NATURAL = re.compile(r"[\s,。！？、；：\u201c\u201d\u2018\u2019（）【】]")
 _CN_WORD = re.compile(r"[\u4e00-\u9fa5]{2,4}")
 
 _VALID_TLD = re.compile(r'\.[a-zA-Z]{2,6}$')
 _IP_PATH_PREFIX = re.compile(r'(?:/\d|:\d)')  # 匹配 /24 或 :8080 这类路径/端口
 
-# 地址正则预编译（fix P2）
+# 地址正则预编译
 _ADDRESS_RE = re.compile(
     r"[\u4e00-\u9fa5]{2,}"
     r"(?:省|市|区|县|镇|乡|街道|路|街|巷|弄|号|栋|楼|室|单元|村|组|社区)"
@@ -81,7 +100,7 @@ def is_unstructured_text(value_str: str) -> bool:
     if not value_str or not isinstance(value_str, str):
         return False
     s = value_str.strip()
-    # [F4] 阈值从 20 降到 10，避免漏掉"备注: 王五 13800138000"这类短文本
+    # 阈值 10：避免漏掉"备注: 王五 13800138000"这类短文本
     if len(s) <= 10:
         return False
     if s.startswith(("{", "[", "<")):
@@ -109,28 +128,34 @@ def _make_finding(db_type, db_name, table_name, field_col_name,
 
 def _scan_chinese_names(text: str) -> list:
     """
-    识别规则（fix B1/B5）：
-      - 3-4 字名：姓氏匹配即可（准确率高）
-      - 2 字名：必须有触发词上下文（避免"张力"/"王府"等 FP）
-      - 复姓：前2字在 COMPOUND_SURNAMES 中视为4字名
+    识别规则：
+      - 3-4 字名：姓氏匹配即可
+      - 2 字名：必须有触发词上下文
+      - 复姓：前 2 字在 COMPOUND_SURNAMES 中视为 4 字名
+    新增过滤：
+      - [P0-B] 职务/称谓后缀 → 过滤
+      - [P0-D] 动词/病理/分词切片字 → 过滤
     """
     results = []
     for m in _CN_WORD.finditer(text):
         name = m.group()
         if _NAME_BLACKLIST_RE.search(name):
             continue
-        # [fix] 混入地址/机构用字 → 不是人名（防 '东门街道' '家庄市石'）
+        # 混入地址/机构用字 → 不是人名
         if any(c in _NAME_ADDR_CHARS for c in name):
             continue
-        # [FP-fix P0-B] 职务/称谓后缀（王审计员/张警官/xxx先生）
+        # [P0-B] 职务/称谓后缀（王审计员/张警官/xxx先生）
         if is_job_title_name(name):
+            continue
+        # [P0-D] 动词 / 病理 / 分词切片字（高血压/公积金提/家庭住）
+        if _is_verbish_name(name):
             continue
 
         is_surname_match = False
         # 单字姓
         if name[0] in _SURNAMES_SET:
             is_surname_match = True
-        # 复姓（fix B5）
+        # 复姓
         elif len(name) >= 3 and name[:2] in COMPOUND_SURNAMES:
             is_surname_match = True
 
@@ -138,7 +163,7 @@ def _scan_chinese_names(text: str) -> list:
             continue
 
         if len(name) >= 3:
-            # 3-4 字名直接认定（fix B1：原来 len >= 2 永真）
+            # 3-4 字名直接认定
             results.append(("CHINESE_NAME", name))
         else:
             # 2 字名需要触发词上下文
@@ -151,7 +176,7 @@ def _scan_chinese_names(text: str) -> list:
 
 
 def _scan_addresses(text: str) -> list:
-    # [fix #8] 用统一校验，strict=False（长文本中地址常被分词打断，放宽长度到 10）
+    # 长文本中地址常被分词打断，放宽长度到 10；核心校验由 is_valid_address 统一做
     return [
         ("ADDRESS", m.group())
         for m in _ADDRESS_RE.finditer(text)
@@ -160,24 +185,31 @@ def _scan_addresses(text: str) -> list:
 
 
 # UIE schema 实体类型 → sensitive_type 映射
+# 注意：schema 已裁剪，这里同步只保留 4 种
 _UIE_TYPE_MAP = {
-    "人名": "CHINESE_NAME",
-    "家庭住址": "ADDRESS",
-    "手机号码": "PHONE_NUMBER",
-    "身份证号": "ID_CARD",
-    "银行卡号": "BANK_CARD",
-    "电子邮箱": "EMAIL",
+    # "人名":     "CHINESE_NAME",   # [裁剪] 正则+姓氏词典已够用，UIE 易 FP
+    # "家庭住址": "ADDRESS",        # [裁剪] 同上
+    "手机号码":  "PHONE_NUMBER",
+    "身份证号":  "ID_CARD",
+    "银行卡号":  "BANK_CARD",
+    "电子邮箱":  "EMAIL",
 }
 
 
 def _run_uie(text: str) -> list:
-    """调用 UIE 推理，超长文本分块处理（fix P6），受 AI 信号量保护。"""
+    """
+    调用 UIE 推理。
+      - UIE_ENABLED=0：直接返回空，完全跳过
+      - 模型不可用：返回空
+      - 否则按 UIE_MAX_CHUNK 分块推理，受 AI 信号量保护
+    """
+    if not UIE_ENABLED:
+        return []
     uie = get_uie_engine()
     if uie is None:
         return []
 
     results = []
-    # 按 UIE_MAX_CHUNK 分块，避免超长文本 OOM
     chunks = [text[i:i + UIE_MAX_CHUNK] for i in range(0, len(text), UIE_MAX_CHUNK)]
 
     try:
@@ -203,10 +235,10 @@ def _run_uie(text: str) -> list:
 def _post_filter(findings: list, text: str, field_name: str = None) -> list:
     """
     过滤非结构化文本的 FP。统一在这里做，覆盖所有上游路径：
-      - [FP-fix P0-A] 字段黑名单：CHINESE_NAME 跳过
-      - [FP-fix P0-B] 职务/称谓后缀：CHINESE_NAME 跳过（UIE/正则/姓氏扫描三路都能兜住）
-      - 原有：IP_ADDRESS 剔除紧跟 /数字或 :数字 的版本/端口/CIDR
-      - 原有：EMAIL 剔除无合法 TLD 的
+      - [P0-A] 字段黑名单：CHINESE_NAME 跳过
+      - [P0-B] 职务/称谓后缀：CHINESE_NAME 跳过
+      - IP_ADDRESS 剔除紧跟 /数字 或 :数字 的版本/端口/CIDR
+      - EMAIL 剔除无合法 TLD 的
     """
     result = []
     field_blacklisted = bool(field_name) and is_name_fp_field(field_name)
@@ -215,22 +247,21 @@ def _post_filter(findings: list, text: str, field_name: str = None) -> list:
         val = f.get("extracted_value", "")
 
         if stype == "CHINESE_NAME":
-            # [FP-fix P0-A] 字段在 FP 黑名单 → 所有中文名全部丢
+            # [P0-A] 字段在 FP 黑名单 → 所有中文名全部丢
             if field_blacklisted:
                 continue
-            # [FP-fix P0-B] 称谓型名字（兜底 UIE 可能返回的 "王审计员"）
+            # [P0-B] 称谓型名字（兜底 UIE 可能返回的"王审计员"；虽然 schema 已裁剪，
+            #        但保留此检查防其它路径漏网）
             if is_job_title_name(val):
                 continue
 
         if stype == "IP_ADDRESS":
-            # 在原文中定位该值，检查其后是否紧跟 /数字 或 :数字（版本号/端口/CIDR）
             idx = text.find(val)
             if idx >= 0:
                 after = text[idx + len(val):idx + len(val) + 4]
                 if _IP_PATH_PREFIX.match(after):
                     continue
         elif stype == "EMAIL":
-            # 域名部分必须有合法 TLD
             if not _VALID_TLD.search(val):
                 continue
         result.append(f)
@@ -254,22 +285,33 @@ def scan_unstructured_field(field_name, value_str, record_id,
                 record_id, stype, val,
             ))
 
-    # 正则扫描（排除姓名/地址，用更精准的专项逻辑处理）
+    # 1) 正则扫描（姓名/地址走专项逻辑）
     for stype, val in extract_sensitive_from_value(value_str):
         if stype not in ("CHINESE_NAME", "ADDRESS"):
             _add(stype, val)
 
-    # 中文姓名（上下文+字长双重过滤，fix B1）
+    # 2) 中文姓名（姓氏词典 + 黑名单 + P0-B/P0-D 过滤）
     for stype, val in _scan_chinese_names(value_str):
         _add(stype, val)
 
-    # 地址（预编译正则，fix P2）
+    # 3) 地址
     for stype, val in _scan_addresses(value_str):
         _add(stype, val)
 
-    # UIE NER（分块处理，fix P6）
-    for stype, val in _run_uie(value_str):
-        _add(stype, val)
+    # 4) UIE NER —— 审计模式下不合并，只打日志
+    uie_raw = _run_uie(value_str)
+    if uie_raw:
+        if UIE_AUDIT:
+            regex_keys = {(f["sensitive_type"], f["extracted_value"]) for f in findings}
+            for stype, val in uie_raw:
+                in_regex = (stype, val) in regex_keys
+                _uie_logger.warning(
+                    "UIE_DIFF table=%s field=%s id=%s type=%s val=%r in_regex=%s",
+                    table_name, field_col_name, record_id, stype, val, in_regex,
+                )
+        else:
+            for stype, val in uie_raw:
+                _add(stype, val)
 
     findings = _post_filter(findings, value_str, field_name=field_name)
     return findings

@@ -54,49 +54,6 @@ _NAME_ADDR_CHARS = frozenset(
     "局院厅局部处司委办站场库所馆组"
 )
 
-# ── [P0-C] ADDRESS 硬清洗 ─────────────────────────────────────────
-# 地址字段常见 label 前缀：extracted_value 若以这些开头，说明把 KV 文本整段吞了
-_ADDR_LABEL_PREFIXES = (
-    "家庭住址", "现住址", "联系地址", "通讯地址", "户籍地址", "居住地址",
-    "收货地址", "详细地址", "办公地址", "单位地址",
-    "地址", "住址", "住所", "家庭地址",
-    "address", "addr", "location", "home_address", "residence",
-)
-# 地址里不该出现的断句符（出现说明是一段文本，不是单一地址值）
-_ADDR_STOP_CHARS = frozenset("，。；！？\n\r\t、：:;\"'")
-
-# 地址合法结尾词（用于尾部校验）
-_ADDR_TAIL_WORDS = (
-    "号", "室", "栋", "楼", "弄", "巷", "组", "村", "院", "座", "单元",
-    "街", "路", "道", "里", "苑", "区", "厂", "所", "层",
-)
-
-# ── [P0-D] CHINESE_NAME 动词/病症字黑名单 ────────────────────────
-# 名字第 2 字起出现这些字几乎必然是 FP。
-# 覆盖：公积金提/高血压/家庭住/黄金贷/朱砂症...
-_NAME_VERB_CHARS = frozenset(
-    # 虚词/连词（长文本分词遗留）
-    "的了在是有和对与及或但也把被让使得从向到由于之所以因为如果"
-    # 动词
-    "提取查询申请办理登记发放缴纳支付购买出售转让抵押解除审批审核"
-    "办开关停付收发放转出入进退补退还"
-    # 病症/器官（"高血压"/"高血糖"/"肝炎"等）
-    "压症炎病疾患瘤癌肿烧疼痒痛晕喘"
-    "肝肺脾胃肾脑心血糖尿便汗尿"
-    # 金融/税务名词
-    "金款费税贷借息率额值账户单据证明"
-    # 物流/房产名词
-    "房车座站港店铺厅馆楼宅园"
-)
-
-
-def _is_verbish_name(name: str) -> bool:
-    """名字从第2字起含动词/病症/虚词 → 判为 FP。"""
-    if len(name) < 2:
-        return False
-    return any(c in _NAME_VERB_CHARS for c in name[1:])
-
-
 # ── [FP-fix P0-A] 字段名黑名单 ─────────────────────────────────────
 # 这些列里出现的"中文名"几乎全是职务占位符（张警官/王审计员/李专员），
 # 不是真实个人敏感信息。证据：example.csv 里这些字段没有任何命中，
@@ -138,6 +95,38 @@ def is_job_title_name(name: str) -> bool:
     if not name:
         return False
     return any(name.endswith(suf) for suf in NAME_JOB_SUFFIXES)
+
+
+# ── [FP-fix P0-D] 动词 / 病理 / 分词切片 字符黑名单 ─────────────
+# 原则：只收"真实中文人名中第 2-4 字几乎不会出现"的字，避免误杀真名字。
+# 命中场景：
+#   "高血压" → 高(姓) + 血 + 压   ← "压" 在集合 → 过滤
+#   "公积金提" → 公(姓) + 积 + 金 + 提  ← "提" 在集合 → 过滤
+#   "家庭住"  → 家(姓) + 庭 + 住  ← "住" 在集合 → 过滤
+# 放弃："金/血/糖/心/账/户" 等字，因为真人名里会出现（如"王金"/"李心"）。
+_NAME_VERB_CHARS = frozenset(
+    # 虚词：几乎不会作人名内部字
+    "的了是在有和与及或但也把被让使"
+    # 病理术语
+    "炎症瘤癌疾患肿疼痛"
+    # 器官（真人名里罕见）
+    "肝肺脾胃肾脑胰"
+    # 高频 FP 触发字（公积金"提" / 高血"压" / 家庭"住"）
+    "压住提取申办"
+    # 分词遗留常见虚字
+    "及等均各某若"
+)
+
+
+def _is_verbish_name(name: str) -> bool:
+    """
+    名字从第 2 字起含动词 / 病理 / 虚词 字 → 判为 FP。
+    首字是姓氏（单独做姓氏白名单校验），所以只扫 name[1:]。
+    """
+    if len(name) < 2:
+        return False
+    return any(c in _NAME_VERB_CHARS for c in name[1:])
+
 
 FIELD_NAME_DICT = {
     "CHINESE_NAME": [
@@ -238,9 +227,8 @@ REGEX_PATTERNS = {
         r"(?<!\d)[3-9]\d{15,18}(?!\d)"
     ),
     "PASSPORT": re.compile(
-        r"(?<![A-Z0-9])[EGDPS]\d{8}(?![A-Z0-9])"  # [修改] 添加了 P 和 S 护照类型，防止漏报
+        r"(?<![A-Z0-9])[EGDPS]\d{8}(?![A-Z0-9])"
     ),
-    # [修复] 匹配海字第、空字第、南字第等所有兵种军区前缀，防止漏报
     "MILITARY_ID": re.compile(
         r"[\u4e00-\u9fa5]{1,2}字第\s*\d{4,8}\s*号"
     ),
@@ -253,44 +241,34 @@ REGEX_PATTERNS = {
     "GPS_COORDINATE": re.compile(
         r"-?\d{1,3}\.\d{4,},\s*-?\d{1,3}\.\d{4,}"
     ),
-    # [修复] 新能源车牌可能有6位数字，并且可能包含中间的点
     "LICENSE_PLATE": re.compile(
         r"[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤川青藏琼宁夏]"
         r"[A-Z][·•]?[A-Z0-9]{4,6}(?!\d)"
     ),
-    # [修复] 强制要求17位字符中必须包含至少一个字母，防止把17位纯数字的银行卡误判为车架号
     "VIN_CODE": re.compile(
         r"(?<![A-HJ-NPR-Z0-9])(?=.*[A-HJ-NPR-Z])[A-HJ-NPR-Z0-9]{17}(?![A-HJ-NPR-Z0-9])"
     ),
-    # 统一社会信用代码：第1位登记管理部门(1-9/A-N/P-Y) + 第2位机构类别(1-9/A-Z) + 6位行政区划 + 9位组织机构 + 1位校验
     "USCC": re.compile(
         r"(?<![A-Z0-9])[0-9A-NP-Y][0-9A-Z]\d{6}[0-9A-Z]{9}[0-9A-Z](?![A-Z0-9])"
     ),
-    # [修改] 营业执照 15 位纯数字无结构特征，主扫逻辑中不再盲扫，
-    #        改为仅在字段名命中 BUSINESS_LICENSE_NO 时由 extract_by_field_hint 显式调用。
     "BUSINESS_LICENSE_NO": re.compile(
         r"(?<!\d)[1-9]\d{14}(?!\d)"
     ),
-    # 社保号：省份汉字 + 2大写字母 + 8位数字，共11位
     "SOCIAL_SECURITY_NO": re.compile(
         r"[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤川青藏琼宁夏][A-Z]{2}\d{8}"
     ),
-    # 住房公积金：2位城市代码 + 11位数字，共13位
     "HOUSING_FUND_NO": re.compile(
         r"(?<![A-Z])[A-Z]{2}20[12]\d{8}(?!\d)"
     ),
-    # 医保卡号：YB + 14-16位数字
     "MEDICAL_INSURANCE_NO": re.compile(
         r"YB\d{14,16}"
     ),
-    # 病历号：MR + 9位数字，共11位
     "MEDICAL_RECORD_NO": re.compile(
         r"MR\d{9}"
     ),
     "CHINESE_NAME": re.compile(
         r"[\u4e00-\u9fa5]{2,4}"
     ),
-    # [修复] 限制省市区前缀的汉字长度，防止在长文本中向前贪婪吞噬无关文字导致大规模误报
     "ADDRESS": re.compile(
         r"(?:(?:[\u4e00-\u9fa5]{2,4}省|[\u4e00-\u9fa5]{2,5}自治区)\s*)?"
         r"(?:[\u4e00-\u9fa5]{2,6}市\s*)?"
@@ -300,17 +278,14 @@ REGEX_PATTERNS = {
 }
 
 # ── 密码/密钥专项正则 ──────────────────────────────────────────────
-# [改进] 拆分成独立正则，逻辑清晰，每种类型自带提取策略
 _BCRYPT_RE = re.compile(r"\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}")
 _SK_KEY_RE = re.compile(r"sk-[A-Za-z0-9]{20,}")
-_AK_KEY_RE = re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{16}")  # AWS Access Key
-# MD5 / SHA-1 / SHA-256 哈希（32 / 40 / 64 位 hex，两端不能紧邻 hex 字符）
+_AK_KEY_RE = re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{16}")
 _HASH_RE = re.compile(
     r"(?<![a-fA-F0-9])"
     r"(?:[a-fA-F0-9]{32}|[a-fA-F0-9]{40}|[a-fA-F0-9]{64})"
     r"(?![a-fA-F0-9])"
 )
-# 键值对（支持带引号和不带引号）：password = 'xxx' / password:"xxx" / password=xxx
 _PWD_KV_RE = re.compile(
     r"(?:password|passwd|pwd|secret|token|api[_-]?key|private[_-]?key|"
     r"access[_-]?token|auth[_-]?token|refresh[_-]?token|credential)"
@@ -393,25 +368,16 @@ def _extract_password_candidates(value_str: str) -> list:
             seen.add(val)
             results.append(("PASSWORD_OR_SECRET", val))
 
-    # bcrypt 哈希 —— 整串即为敏感值
     for m in _BCRYPT_RE.finditer(value_str):
         _add(m.group())
-
-    # OpenAI 类 sk- 密钥
     for m in _SK_KEY_RE.finditer(value_str):
         _add(m.group())
-
-    # AWS Access Key
     for m in _AK_KEY_RE.finditer(value_str):
         _add(m.group())
-
-    # MD5 / SHA 哈希
     for m in _HASH_RE.finditer(value_str):
         _add(m.group())
 
-    # k=v 形式
     for m in _PWD_KV_RE.finditer(value_str):
-        # group(1) 是带引号匹配，group(2) 是不带引号匹配
         val = m.group(1) if m.group(1) is not None else m.group(2)
         if val:
             _add(val.strip())
@@ -419,17 +385,38 @@ def _extract_password_candidates(value_str: str) -> list:
     return results
 
 
+# ── [P0-C] ADDRESS 硬清洗常量 ─────────────────────────────────────
+# 出现在 extracted_value 开头表示 label 被一起吞进去了，整值不干净
+_ADDR_LABEL_PREFIXES = (
+    "家庭住址", "现住址", "联系地址", "通讯地址", "户籍地址", "居住地址",
+    "收货地址", "详细地址", "办公地址", "单位地址",
+    "地址", "住址", "住所", "家庭地址",
+    "address", "addr", "location", "home_address", "residence",
+)
+# 地址整值里不该出现的断句符（出现说明是一段文本，不是单一地址）
+# 同时覆盖中英文标点和空白
+_ADDR_STOP_CHARS = frozenset(
+    "，。；！？、：\u201c\u201d\u2018\u2019"   # 中文标点
+    ",.;:!?\"'"                               # 英文标点
+    "\n\r\t"                                  # 空白
+)
+# 地址合法结尾词（用于尾部 6 字内校验）
+_ADDR_TAIL_WORDS = (
+    "号", "室", "栋", "楼", "弄", "巷", "组", "村", "院", "座", "单元",
+    "街", "路", "道", "里", "苑", "区", "厂", "所", "层",
+)
+
+
 def extract_sensitive_from_value(value_str: str) -> list:
     if not value_str or not isinstance(value_str, str):
         return []
 
-    # [性能 #12] 超长输入截断：50KB 文本跑 20+ 正则在纯 Python 下可能到几百毫秒
-    # 一张含长日志的大表能因此拖垮整个时间预算
+    # [性能 #12] 超长输入截断
     if len(value_str) > MAX_SCAN_LEN:
         value_str = value_str[:MAX_SCAN_LEN]
 
     results = []
-    seen = set()  # 去重：同一 (stype, val) 只输出一次
+    seen = set()
     found_id_card_spans = []
     found_uscc_spans = []
 
@@ -457,12 +444,9 @@ def extract_sensitive_from_value(value_str: str) -> list:
         if not overlap and validate_luhn(m.group()):
             _add("BANK_CARD", m.group())
 
-    # [改进] 密码/密钥专项提取，拆分成独立正则，更清晰
     for stype, val in _extract_password_candidates(value_str):
         _add(stype, val)
 
-    # [修改] skip_types 追加 BUSINESS_LICENSE_NO —— 盲扫会产生海量 FP，
-    #        该类型只能在字段名命中时通过 extract_by_field_hint 调用
     skip_types = {
         "ID_CARD", "USCC", "BANK_CARD",
         "CHINESE_NAME", "ADDRESS",
@@ -474,18 +458,18 @@ def extract_sensitive_from_value(value_str: str) -> list:
         for m in pattern.finditer(value_str):
             _add(stype, m.group())
 
-    # 使用模块级预编译的 frozenset（fix P1）
+    # ── CHINESE_NAME：字典+黑名单+姓氏首字+[P0-D]动词/病理字过滤 ──
     for m in REGEX_PATTERNS["CHINESE_NAME"].finditer(value_str):
         name = m.group()
         if _NAME_BLACKLIST_RE.search(name):
             continue
-        # [fix] 名字里混入地址/机构用字 → 大概率是从地址/文本里误切的片段
+        # 名字里混入地址/机构用字 → 大概率从地址文本里误切
         if any(c in _NAME_ADDR_CHARS for c in name):
             continue
-        # [FP-fix P0-B] 职务/称谓后缀（王审计员/张警官/xxx先生）
+        # [P0-B] 职务/称谓后缀（王审计员/张警官/xxx先生）
         if is_job_title_name(name):
             continue
-        # [P0-D] 动词/病症字黑名单（公积金提/高血压/家庭住等）
+        # [P0-D] 动词 / 病理 / 分词切片字（高血压/公积金提/家庭住）
         if _is_verbish_name(name):
             continue
         if name[0] in _SURNAMES_SET:
@@ -494,19 +478,24 @@ def extract_sensitive_from_value(value_str: str) -> list:
         if len(name) >= 3 and name[:2] in COMPOUND_SURNAMES:
             _add("CHINESE_NAME", name)
 
+    # ── ADDRESS：长度 + [P0-C] label 前缀拒绝 ──────────────────────
     for m in REGEX_PATTERNS["ADDRESS"].finditer(value_str):
-        if len(m.group()) >= 10:
-            _add("ADDRESS", m.group())
+        addr = m.group()
+        if len(addr) < 10:
+            continue
+        # [P0-C] 整值以 label 开头 → 正则贪婪吞进了标签，丢弃
+        low = addr.lower()
+        if any(low.startswith(p.lower()) for p in _ADDR_LABEL_PREFIXES):
+            continue
+        _add("ADDRESS", addr)
 
     return results
 
 
 def extract_by_field_hint(field_name: str, value_str: str) -> list:
     """
-    [新增] 当字段名明确提示敏感类型时，显式触发那些在盲扫中被跳过的正则。
+    当字段名明确提示敏感类型时，显式触发那些在盲扫中被跳过的正则。
     目前只用于 BUSINESS_LICENSE_NO —— 15 位纯数字只有在字段名提示下才识别。
-
-    调用方：scan_structured_field 在默认分支补调一次这个函数。
     """
     hits = []
     if not value_str or not isinstance(value_str, str):
@@ -519,10 +508,8 @@ def extract_by_field_hint(field_name: str, value_str: str) -> list:
     if "BUSINESS_LICENSE_NO" in field_types:
         for m in REGEX_PATTERNS["BUSINESS_LICENSE_NO"].finditer(value_str):
             val = m.group()
-            # 排除与银行卡冲突（通过 Luhn 则按银行卡处理）
             if validate_luhn(val):
                 continue
-            # 排除 18 位 USCC/ID_CARD 的子串（避免重叠）
             if REGEX_PATTERNS["USCC"].fullmatch(val):
                 continue
             if not validate_business_license(val):
@@ -532,28 +519,34 @@ def extract_by_field_hint(field_name: str, value_str: str) -> list:
     return hits
 
 
-# ADDRESS 统一校验（fix #8）
+# ── ADDRESS 统一校验 ────────────────────────────────────────────
 _ADDR_ADMIN_CHARS = frozenset("省市区县")
 _ADDR_STREET_CHARS = frozenset("路街巷弄号栋楼室")
 
 
 def is_valid_address(val: str, strict: bool = True) -> bool:
     """
-    ADDRESS 统一校验。
-    - strict=True（结构化字段）: 长度 >=15 + 含行政 + 含街道 + 无 label/句读 + 合法尾部
-    - strict=False（长文本）   : 长度 >=10 + 其余同上（放宽长度）
+    ADDRESS 统一校验（[P0-C] 加强版）。
+      - strict=True（结构化字段）: 长度 >=15 + 含行政 + 含街道 + 无 label 前缀
+                                   + 无断句符 + 合法尾部
+      - strict=False（长文本）   : 长度 >=10 + 其余同上（放宽长度）
+
+    新增三道闸（相对旧版）：
+      1) 整值以地址 label 开头（"家庭住址..."）→ 拒绝
+      2) 含断句/换行符 → 是一段文本而非单一地址 → 拒绝
+      3) 尾部 6 字内未出现 号/室/栋/街/路 等 → 地址收尾不完整 → 拒绝
     """
     if not val:
         return False
     v = val.strip()
 
-    # [P0-C-1] 整值以 label 开头 → 不是干净地址（如 "家庭住址:北京..."）
+    # [P0-C-1] 整值以 label 开头（多为正则贪婪吞进了列名/前缀）
     low = v.lower()
     for p in _ADDR_LABEL_PREFIXES:
         if low.startswith(p.lower()):
             return False
 
-    # [P0-C-2] 含断句/换行符 → 是段落文本而非单一地址
+    # [P0-C-2] 含断句/换行 → 是段落文本，不是单一地址
     if any(c in _ADDR_STOP_CHARS for c in v):
         return False
 
