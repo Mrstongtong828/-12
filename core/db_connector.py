@@ -52,41 +52,115 @@ def get_all_tables(conn, db_type: str, db_name: str) -> list:
     except Exception as e:
         print(f"[ERROR] 获取表列表失败 {db_type}/{db_name}: {e}")
         return []
-
-
 def get_primary_key_col(conn, db_type: str, db_name: str, table_name: str):
+    """
+    优先级链：
+      1. 优先找名字匹配 <table>_id 或 {table_name_singular}_id 的整型列
+      2. 否则找任何名字以 _id 结尾或等于 id 的整型列
+      3. 否则退到真实主键(原逻辑)
+      4. 都没有返回 None(调用方会降级为行号)
+    """
     try:
         if db_type == "mysql":
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS "
-                    "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_KEY = 'PRI'",
+                    "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_KEY, ORDINAL_POSITION "
+                    "FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
+                    "ORDER BY ORDINAL_POSITION",
                     (db_name, table_name),
                 )
-                for row in cur.fetchall():
-                    if row["DATA_TYPE"] in ("int", "bigint", "smallint", "tinyint", "mediumint"):
-                        return row["COLUMN_NAME"]
-                return None
+                cols = cur.fetchall()
+            return _pick_pk_from_cols(cols, table_name, is_mysql=True)
+
         elif db_type == "postgresql":
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT a.attname, t.typname
-                    FROM pg_index i
-                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                    SELECT a.attname, t.typname, a.attnum
+                    FROM pg_attribute a
                     JOIN pg_type t ON t.oid = a.atttypid
-                    WHERE i.indrelid = %s::regclass AND i.indisprimary
+                    WHERE a.attrelid = %s::regclass
+                      AND a.attnum > 0
+                      AND NOT a.attisdropped
+                    ORDER BY a.attnum
                     """,
                     (table_name,),
                 )
-                for col_name, type_name in cur.fetchall():
-                    if type_name in ("int4", "int8", "int2", "int", "integer", "bigint",
-                                     "smallint", "serial", "bigserial"):
-                        return col_name
-                return None
+                rows = cur.fetchall()
+            # 标准化成 dict 列表，复用下面的选择逻辑
+            cols = [{"COLUMN_NAME": r[0], "DATA_TYPE": r[1],
+                     "COLUMN_KEY": "", "ORDINAL_POSITION": r[2]}
+                    for r in rows]
+            # PG 的主键查一次单独补上
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT a.attname FROM pg_index i "
+                    "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
+                    "WHERE i.indrelid = %s::regclass AND i.indisprimary",
+                    (table_name,),
+                )
+                pk_names = {r[0] for r in cur.fetchall()}
+            for c in cols:
+                if c["COLUMN_NAME"] in pk_names:
+                    c["COLUMN_KEY"] = "PRI"
+            return _pick_pk_from_cols(cols, table_name, is_mysql=False)
     except Exception as e:
         print(f"[ERROR] 获取主键失败 {table_name}: {e}")
         return None
+
+
+_INT_TYPES_MYSQL = {"int", "bigint", "smallint", "tinyint", "mediumint"}
+_INT_TYPES_PG = {"int2", "int4", "int8", "int", "integer",
+                 "bigint", "smallint", "serial", "bigserial"}
+
+
+def _pick_pk_from_cols(cols, table_name, is_mysql=True):
+    """
+    从列元数据里挑最适合当 record_id 的列。
+    cols: [{"COLUMN_NAME", "DATA_TYPE", "COLUMN_KEY", "ORDINAL_POSITION"}, ...]
+    """
+    int_types = _INT_TYPES_MYSQL if is_mysql else _INT_TYPES_PG
+
+    # 只保留整型列
+    int_cols = [c for c in cols if c["DATA_TYPE"].lower() in int_types]
+    if not int_cols:
+        return None
+
+    # 预计算 name -> col 的映射
+    lower_name = {c["COLUMN_NAME"].lower(): c for c in int_cols}
+
+    # === 层级 1: 业务主键命名（最优先）===
+    # 精确匹配 <table>_id / <singular_table>_id
+    tname = table_name.lower()
+    candidates = [f"{tname}_id"]
+    # 常见表名复数去尾：users -> user_id, orders -> order_id, categories -> category_id
+    if tname.endswith("ies") and len(tname) > 3:
+        candidates.append(f"{tname[:-3]}y_id")
+    elif tname.endswith("s") and len(tname) > 1:
+        candidates.append(f"{tname[:-1]}_id")
+    for cand in candidates:
+        if cand in lower_name:
+            return lower_name[cand]["COLUMN_NAME"]
+
+    # === 层级 2: 名字匹配 id 或 *_id（次优先）===
+    # 先找 "id"
+    if "id" in lower_name:
+        return lower_name["id"]["COLUMN_NAME"]
+    # 再找任何 _id 结尾的
+    for lname, c in lower_name.items():
+        if lname.endswith("_id"):
+            return c["COLUMN_NAME"]
+
+    # === 层级 3: 真实主键（最后兜底）===
+    for c in int_cols:
+        if c["COLUMN_KEY"] == "PRI":
+            return c["COLUMN_NAME"]
+
+    # === 层级 4: 第一个整型列 ===
+    return int_cols[0]["COLUMN_NAME"]
+
+ 
 
 
 def stream_table_rows(conn, db_type: str, table_name: str, pk_col):
