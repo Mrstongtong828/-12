@@ -103,7 +103,8 @@ FIELD_NAME_DICT = {
         r"\bshehui_xinyong\b",
     ],
     "BUSINESS_LICENSE_NO": [
-        r"\bbusiness_license\b", r"\blicense_no\b",
+        r"\bbusiness_license\b", r"\blicense_no\b", r"\byingye_zhizhao\b",
+        r"\bregistration_no\b",
     ],
     "SOCIAL_SECURITY_NO": [
         r"\bsocial_security\b", r"\bss_no\b", r"\bshebao\b", r"\binsurance_no\b",
@@ -121,6 +122,7 @@ FIELD_NAME_DICT = {
         r"\bpassword\b", r"\bpasswd\b", r"\bpwd\b", r"\bsecret\b",
         r"\btoken\b", r"\bapi_key\b", r"\bapikey\b", r"\bprivate_key\b",
         r"\bsecret_key\b", r"\baccess_token\b", r"\bauth_token\b",
+        r"\brefresh_token\b", r"\bcredential\b",
     ],
 }
 
@@ -143,7 +145,7 @@ REGEX_PATTERNS = {
         r"(?<!\d)[3-9]\d{15,18}(?!\d)"
     ),
     "PASSPORT": re.compile(
-        r"(?<![A-Z0-9])[EGDPS]\d{8}(?![A-Z0-9])" # [修改] 添加了 P 和 S 护照类型，防止漏报
+        r"(?<![A-Z0-9])[EGDPS]\d{8}(?![A-Z0-9])"  # [修改] 添加了 P 和 S 护照类型，防止漏报
     ),
     # [修复] 匹配海字第、空字第、南字第等所有兵种军区前缀，防止漏报
     "MILITARY_ID": re.compile(
@@ -171,8 +173,10 @@ REGEX_PATTERNS = {
     "USCC": re.compile(
         r"(?<![A-Z0-9])[0-9A-NP-Y][0-9A-Z]\d{6}[0-9A-Z]{9}[0-9A-Z](?![A-Z0-9])"
     ),
+    # [修改] 营业执照 15 位纯数字无结构特征，主扫逻辑中不再盲扫，
+    #        改为仅在字段名命中 BUSINESS_LICENSE_NO 时由 extract_by_field_hint 显式调用。
     "BUSINESS_LICENSE_NO": re.compile(
-        r"(?<!\d)[1-9]\d{14}(?!\d)" # [修改] 拓宽营业执照匹配范围，不仅限43/44开头
+        r"(?<!\d)[1-9]\d{14}(?!\d)"
     ),
     # 社保号：省份汉字 + 2大写字母 + 8位数字，共11位
     "SOCIAL_SECURITY_NO": re.compile(
@@ -200,12 +204,27 @@ REGEX_PATTERNS = {
         r"(?:[\u4e00-\u9fa5]{2,6}[区县]\s*)?"
         r"[\u4e00-\u9fa5a-zA-Z\d\-]{2,30}(?:街道|路|街|号|栋|室|弄|巷|村|组)"
     ),
-    "PASSWORD_OR_SECRET": re.compile(
-        r"(?:\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}|sk-[A-Za-z0-9]{20,}|"
-        r"(?:password|passwd|pwd|secret|token|api_key|apikey|key)\s*[=:]\s*([a-zA-Z0-9_@#$%^&*\-!]+))", # [修改] 增加了 () 捕获组提取实际密码值
-        re.IGNORECASE,
-    ),
 }
+
+# ── 密码/密钥专项正则 ──────────────────────────────────────────────
+# [改进] 拆分成独立正则，逻辑清晰，每种类型自带提取策略
+_BCRYPT_RE = re.compile(r"\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}")
+_SK_KEY_RE = re.compile(r"sk-[A-Za-z0-9]{20,}")
+_AK_KEY_RE = re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{16}")  # AWS Access Key
+# MD5 / SHA-1 / SHA-256 哈希（32 / 40 / 64 位 hex，两端不能紧邻 hex 字符）
+_HASH_RE = re.compile(
+    r"(?<![a-fA-F0-9])"
+    r"(?:[a-fA-F0-9]{32}|[a-fA-F0-9]{40}|[a-fA-F0-9]{64})"
+    r"(?![a-fA-F0-9])"
+)
+# 键值对（支持带引号和不带引号）：password = 'xxx' / password:"xxx" / password=xxx
+_PWD_KV_RE = re.compile(
+    r"(?:password|passwd|pwd|secret|token|api[_-]?key|private[_-]?key|"
+    r"access[_-]?token|auth[_-]?token|refresh[_-]?token|credential)"
+    r"\s*[:=]\s*"
+    r"(?:[\"']([^\"'\n\r]{4,200})[\"']|([A-Za-z0-9_@#$%^&*\-!.+/=]{6,200}))",
+    re.IGNORECASE,
+)
 
 _ID_CARD_WEIGHTS = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]
 _ID_CARD_CHECK = "10X98765432"
@@ -242,6 +261,22 @@ def validate_uscc(uscc_str: str) -> bool:
     return all(c in valid_chars for c in uscc_str)
 
 
+def validate_business_license(val: str) -> bool:
+    """
+    15 位营业执照号校验：
+      - 全数字
+      - 第 1 位非 0
+      - 第 3-6 位（行政区划代码后 4 位）不全为 0
+    """
+    if len(val) != 15 or not val.isdigit():
+        return False
+    if val[0] == "0":
+        return False
+    if int(val[2:6]) == 0:
+        return False
+    return True
+
+
 def match_field_name(field_name: str) -> list:
     matched = []
     for stype, patterns in _FIELD_NAME_COMPILED.items():
@@ -250,6 +285,45 @@ def match_field_name(field_name: str) -> list:
                 matched.append(stype)
                 break
     return matched
+
+
+def _extract_password_candidates(value_str: str) -> list:
+    """
+    从字符串里提取各类密码/密钥候选值。
+    返回 [(sensitive_type, extracted_value), ...]
+    """
+    results = []
+    seen = set()
+
+    def _add(val):
+        if val and val not in seen:
+            seen.add(val)
+            results.append(("PASSWORD_OR_SECRET", val))
+
+    # bcrypt 哈希 —— 整串即为敏感值
+    for m in _BCRYPT_RE.finditer(value_str):
+        _add(m.group())
+
+    # OpenAI 类 sk- 密钥
+    for m in _SK_KEY_RE.finditer(value_str):
+        _add(m.group())
+
+    # AWS Access Key
+    for m in _AK_KEY_RE.finditer(value_str):
+        _add(m.group())
+
+    # MD5 / SHA 哈希
+    for m in _HASH_RE.finditer(value_str):
+        _add(m.group())
+
+    # k=v 形式
+    for m in _PWD_KV_RE.finditer(value_str):
+        # group(1) 是带引号匹配，group(2) 是不带引号匹配
+        val = m.group(1) if m.group(1) is not None else m.group(2)
+        if val:
+            _add(val.strip())
+
+    return results
 
 
 def extract_sensitive_from_value(value_str: str) -> list:
@@ -285,36 +359,22 @@ def extract_sensitive_from_value(value_str: str) -> list:
         if not overlap and validate_luhn(m.group()):
             _add("BANK_CARD", m.group())
 
-    # [新增] 专门处理密码和密钥，利用正则的捕获组仅提取明文值，防止误报 "password="
-    for m in REGEX_PATTERNS["PASSWORD_OR_SECRET"].finditer(value_str):
-        # 如果有括号捕获组（也就是匹配到了 password=xxx），提取括号里的内容 group(1)
-        # 如果没有（匹配到的是 bcrypt 或 sk- 密钥），直接提取全串 group(0)
-        val = m.group(1) if m.lastindex else m.group()
-        _add("PASSWORD_OR_SECRET", val)
+    # [改进] 密码/密钥专项提取，拆分成独立正则，更清晰
+    for stype, val in _extract_password_candidates(value_str):
+        _add(stype, val)
 
-    # [修改] 将 PASSWORD_OR_SECRET 加入 skip_types，因为上面已经单独处理过了
-    skip_types = {"ID_CARD", "USCC", "BANK_CARD", "CHINESE_NAME", "ADDRESS", "BUSINESS_LICENSE_NO", "PASSWORD_OR_SECRET"}
+    # [修改] skip_types 追加 BUSINESS_LICENSE_NO —— 盲扫会产生海量 FP，
+    #        该类型只能在字段名命中时通过 extract_by_field_hint 调用
+    skip_types = {
+        "ID_CARD", "USCC", "BANK_CARD",
+        "CHINESE_NAME", "ADDRESS",
+        "BUSINESS_LICENSE_NO",
+    }
     for stype, pattern in REGEX_PATTERNS.items():
         if stype in skip_types:
             continue
         for m in pattern.finditer(value_str):
             _add(stype, m.group())
-
-    # 单独处理 BUSINESS_LICENSE_NO，加入额外校验避免与银行卡/ID_CARD/USCC 冲突
-    for m in REGEX_PATTERNS["BUSINESS_LICENSE_NO"].finditer(value_str):
-        val = m.group()
-        # 排除与银行卡冲突：若通过 Luhn 校验则已是银行卡
-        if validate_luhn(val):
-            continue
-        # 排除与 ID_CARD/USCC 的重叠
-        overlap = any(s <= m.start() < e or s < m.end() <= e
-                      for s, e in found_id_card_spans + found_uscc_spans)
-        if overlap:
-            continue
-        # 简单行政区划校验：第3-6位不全为0
-        if int(val[2:6]) < 1:
-            continue
-        _add("BUSINESS_LICENSE_NO", val)
 
     # 使用模块级预编译的 frozenset（fix P1）
     for m in REGEX_PATTERNS["CHINESE_NAME"].finditer(value_str):
@@ -332,3 +392,34 @@ def extract_sensitive_from_value(value_str: str) -> list:
             _add("ADDRESS", m.group())
 
     return results
+
+
+def extract_by_field_hint(field_name: str, value_str: str) -> list:
+    """
+    [新增] 当字段名明确提示敏感类型时，显式触发那些在盲扫中被跳过的正则。
+    目前只用于 BUSINESS_LICENSE_NO —— 15 位纯数字只有在字段名提示下才识别。
+
+    调用方：scan_structured_field 在默认分支补调一次这个函数。
+    """
+    hits = []
+    if not value_str or not isinstance(value_str, str):
+        return hits
+
+    field_types = match_field_name(field_name)
+    if not field_types:
+        return hits
+
+    if "BUSINESS_LICENSE_NO" in field_types:
+        for m in REGEX_PATTERNS["BUSINESS_LICENSE_NO"].finditer(value_str):
+            val = m.group()
+            # 排除与银行卡冲突（通过 Luhn 则按银行卡处理）
+            if validate_luhn(val):
+                continue
+            # 排除 18 位 USCC/ID_CARD 的子串（避免重叠）
+            if REGEX_PATTERNS["USCC"].fullmatch(val):
+                continue
+            if not validate_business_license(val):
+                continue
+            hits.append(("BUSINESS_LICENSE_NO", val))
+
+    return hits
