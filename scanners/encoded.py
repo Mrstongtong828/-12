@@ -1,14 +1,16 @@
 import re
 import base64
 import urllib.parse
-from core.patterns import extract_sensitive_from_value
+from core.patterns import extract_sensitive_from_value, REGEX_PATTERNS
 from core.config import SENSITIVE_LEVEL_MAP
 
 PASSWORD_FIELD_KEYWORDS = {"password", "passwd", "pwd", "secret", "token",
                             "api_key", "apikey", "private_key", "secret_key"}
 
+# ── 模块级预编译正则 ──────────────────────────────────────────────
 _HAS_LETTER = re.compile(r"[a-zA-Z]")
 _HAS_AF = re.compile(r"[a-fA-F]")
+_HAS_CHINESE = re.compile(r"[\u4e00-\u9fa5]")
 _UNICODE_ESC = re.compile(r"\\u[0-9a-fA-F]{4}")
 _PERCENT_ENC = re.compile(r"%[0-9a-fA-F]{2}")
 # 快速预检：base64 合法字符集（fix P4，避免对非 base64 串走完整解码）
@@ -145,6 +147,28 @@ def decode_recursive(value_str: str, max_rounds: int = 5):
     return current, chain
 
 
+def _decoded_looks_sensitive(decoded: str) -> bool:
+    """
+    [fix #9] 判断解码结果是否"看起来有价值"：
+      - 含中文 → 一定是真编码（敏感数据通常含中文）
+      - 含手机号/邮箱/身份证等强特征 → 很可能是真编码
+
+    这样可以避免把正常的英文长串（UUID、哈希、token 本身）
+    误判为"已编码"然后产生不可预测的 FP。
+    """
+    if not decoded:
+        return False
+    if _HAS_CHINESE.search(decoded):
+        return True
+    # 至少命中一个强模式才认为是真编码
+    strong_patterns = ("PHONE_NUMBER", "EMAIL", "ID_CARD", "BANK_CARD",
+                       "ADDRESS", "IP_ADDRESS", "GPS_COORDINATE")
+    for p_name in strong_patterns:
+        if REGEX_PATTERNS[p_name].search(decoded):
+            return True
+    return False
+
+
 def _is_encoded_value(s: str) -> bool:
     if not s or not isinstance(s, str):
         return False
@@ -152,16 +176,23 @@ def _is_encoded_value(s: str) -> bool:
     # 纯数字不视为编码（手机号/身份证等）
     if stripped.isdigit():
         return False
-    # 快速特征判定，避免完整解码（fix P4）
+
+    # URL 编码 / Unicode 转义：特征明显，直接通过
     if _PERCENT_ENC.search(stripped):
         return True
     if _UNICODE_ESC.search(stripped):
         return True
-    # base64/hex 需要做一次完整解码验证
-    if _try_base64_decode(stripped) is not None:
+
+    # [fix #9] base64：除了能解码外，还要求解码结果"看起来有价值"
+    decoded_b64 = _try_base64_decode(stripped)
+    if decoded_b64 is not None and _decoded_looks_sensitive(decoded_b64):
         return True
-    if _try_hex_decode(stripped) is not None:
+
+    # [fix #9] hex：同样要求解码后有价值
+    decoded_hex = _try_hex_decode(stripped)
+    if decoded_hex is not None and _decoded_looks_sensitive(decoded_hex):
         return True
+
     return False
 
 
@@ -197,7 +228,6 @@ def _scan_decoded(decoded: str, record_id, table_name, field_col_name, db_type, 
     if stripped.startswith(("{", "[")):
         # 编码套 JSON
         try:
-            import json
             from scanners.structured import scan_json_value
             sub = scan_json_value(stripped, record_id, table_name, field_col_name, db_type, db_name)
             for f in sub:
