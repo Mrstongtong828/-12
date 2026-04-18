@@ -2,6 +2,7 @@ import json
 import xml.etree.ElementTree as ET
 from core.patterns import (
     extract_sensitive_from_value, match_field_name,
+    extract_by_field_hint,
     _SURNAMES_SET, NAME_BLACKLIST, _FIELD_NAME_COMPILED, _NAME_BLACKLIST_RE,
 )
 from core.config import SENSITIVE_LEVEL_MAP
@@ -15,7 +16,12 @@ except ImportError:
 
 PASSWORD_FIELD_KEYWORDS = {"password", "passwd", "pwd", "secret", "token",
                             "api_key", "apikey", "private_key", "secret_key",
-                            "access_token", "auth_token"}
+                            "access_token", "auth_token", "refresh_token",
+                            "credential"}
+
+# ADDRESS 兜底过滤用的字符集，模块级常量避免每次构建
+_ADDR_ADMIN_CHARS = frozenset("省市区县")
+_ADDR_STREET_CHARS = frozenset("路街巷弄号栋楼室")
 
 
 def _is_password_field(field_name: str) -> bool:
@@ -119,6 +125,56 @@ def scan_xml_value(xml_str, record_id, table_name, field_col_name, db_type, db_n
     return findings
 
 
+def _regex_fallback_scan(value_str, field_name, record_id, table_name,
+                        field_col_name, db_type, db_name, data_form):
+    """
+    通用正则兜底扫描逻辑。从 value_str 里提取所有敏感值，并应用：
+      - CHINESE_NAME 保留条件（字段名提示或首字为已知姓氏）
+      - ADDRESS 保留条件（长度 >=15，同时含行政单位和街道词）
+      - extract_by_field_hint（营业执照等只在字段名命中时才识别的类型）
+
+    data_form 由调用方决定：走 semi_structured fallback 时传 "semi_structured"，
+    走默认结构化扫描时传 "structured"。
+    """
+    findings = []
+
+    # 只在需要时计算 field_hints（CHINESE_NAME 过滤才用得到）
+    field_hints = None
+
+    for stype, val in extract_sensitive_from_value(value_str):
+        if stype == "CHINESE_NAME":
+            if field_hints is None:
+                field_hints = match_field_name(field_name)
+            if "CHINESE_NAME" not in field_hints:
+                # 字段名未命中时，要求首字为已知姓氏且不在黑名单
+                if not (len(val) >= 2
+                        and val[0] in _SURNAMES_SET
+                        and not _NAME_BLACKLIST_RE.search(val)):
+                    continue
+        elif stype == "ADDRESS":
+            # 长度 >=15，且同时含行政单位词和街道词
+            if len(val) < 15:
+                continue
+            if not any(c in _ADDR_ADMIN_CHARS for c in val):
+                continue
+            if not any(c in _ADDR_STREET_CHARS for c in val):
+                continue
+
+        findings.append(_make_finding(
+            db_type, db_name, table_name, field_col_name,
+            record_id, data_form, stype, val,
+        ))
+
+    # [新增] 字段名命中时才触发的敏感类型（当前为 BUSINESS_LICENSE_NO）
+    for stype, val in extract_by_field_hint(field_name, value_str):
+        findings.append(_make_finding(
+            db_type, db_name, table_name, field_col_name,
+            record_id, data_form, stype, val,
+        ))
+
+    return findings
+
+
 def scan_structured_field(field_name, value, record_id, table_name,
                            field_col_name, db_type, db_name):
     if value is None:
@@ -128,6 +184,7 @@ def scan_structured_field(field_name, value, record_id, table_name,
     if not value_str:
         return []
 
+    # 密码字段：整值即为敏感值
     if _is_password_field(field_name):
         return [_make_finding(
             db_type, db_name, table_name, field_col_name,
@@ -136,6 +193,7 @@ def scan_structured_field(field_name, value, record_id, table_name,
 
     data_form = _detect_form(value_str)
 
+    # ── 半结构化分支 ──────────────────────────────────────────────
     if data_form == "semi_structured":
         s = value_str.strip()
         if s.startswith("<"):
@@ -144,32 +202,19 @@ def scan_structured_field(field_name, value, record_id, table_name,
         else:
             results = scan_json_value(value_str, record_id, table_name,
                                       field_col_name, db_type, db_name)
-        # [B2] fallback：伪 JSON/XML 解析失败时走正则扫描
         if results:
             return results
-        # 解析失败，降级为正则扫描（继续执行后续逻辑）
+        # [bug #4 修复] 解析失败时 fallback 走正则，但保留 semi_structured 标签，
+        # 否则伪 JSON/XML 串会被错误分类到 structured 形态，TP 全变 FP+FN
+        return _regex_fallback_scan(
+            value_str, field_name, record_id, table_name,
+            field_col_name, db_type, db_name,
+            data_form="semi_structured",
+        )
 
-    findings = []
-    all_hits = extract_sensitive_from_value(value_str)
-    for stype, val in all_hits:
-        if stype == "CHINESE_NAME":
-            # 保留条件：字段名提示是姓名字段，或首字是已知姓氏
-            field_hints = match_field_name(field_name)
-            if "CHINESE_NAME" not in field_hints:
-                if not (len(val) >= 2 and val[0] in _SURNAMES_SET and not _NAME_BLACKLIST_RE.search(val)):
-                    continue
-        elif stype == "ADDRESS":
-            # 保留条件：长度 >= 15，且同时含行政单位词和街道词
-            _admin = set("省市区县")
-            _street = set("路街巷弄号栋楼室")
-            if len(val) < 15:
-                continue
-            if not any(c in _admin for c in val):
-                continue
-            if not any(c in _street for c in val):
-                continue
-        findings.append(_make_finding(
-            db_type, db_name, table_name, field_col_name,
-            record_id, "structured", stype, val,
-        ))
-    return findings
+    # ── 结构化默认分支 ────────────────────────────────────────────
+    return _regex_fallback_scan(
+        value_str, field_name, record_id, table_name,
+        field_col_name, db_type, db_name,
+        data_form="structured",
+    )
