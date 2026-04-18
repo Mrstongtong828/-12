@@ -113,7 +113,7 @@ def main():
             for db_name in cfg["databases"]
         ]
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             futures = {
                 executor.submit(_scan_database, db_type, db_name, writer, log): (db_type, db_name)
                 for db_type, db_name in tasks
