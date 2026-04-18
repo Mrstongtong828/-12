@@ -1,4 +1,6 @@
 import json
+# structured.py 顶部的 import 追加一项
+from core.config import SENSITIVE_LEVEL_MAP, LEAF_TEXT_MAX_LEN
 import xml.etree.ElementTree as ET
 from core.patterns import (
     extract_sensitive_from_value, match_field_name,
@@ -68,6 +70,9 @@ def scan_json_value(json_str, record_id, table_name, field_col_name, db_type, db
                 decoded, chain = _dec_recursive(obj)
                 if chain:
                     actual = decoded
+            # [性能 #12] JSON 叶子过长时截断
+            if len(actual) > LEAF_TEXT_MAX_LEN:
+                actual = actual[:LEAF_TEXT_MAX_LEN]
             for stype, val in extract_sensitive_from_value(actual):
                 findings.append(_make_finding(
                     db_type, db_name, table_name, field_col_name,
