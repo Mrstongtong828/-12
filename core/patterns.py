@@ -384,7 +384,7 @@ _HASH_RE = re.compile(
 
 # [v3 新增] MD5/SHA hash 必须含至少一个 a-f 字母,否则是纯数字 → 不是 hash
 _HASH_RE_MUST_HAVE_LETTER = re.compile(r"[a-fA-F]")
-)
+
 _PWD_KV_RE = re.compile(
     r"(?:password|passwd|pwd|secret|token|api[_-]?key|private[_-]?key|"
     r"access[_-]?token|auth[_-]?token|refresh[_-]?token|credential)"
@@ -582,19 +582,19 @@ def extract_sensitive_from_value(value_str: str) -> list:
             found_uscc_spans.append((m.start(), m.end()))
 
     for m in REGEX_PATTERNS["BANK_CARD"].finditer(value_str):
-    val = m.group()
-    overlap = any(s <= m.start() < e or s < m.end() <= e
-                  for s, e in found_id_card_spans + found_uscc_spans)
-    if overlap:
-        continue
-    # Luhn 通过 → 直接加
-    if validate_luhn(val):
-        _add("BANK_CARD", val)
-        continue
-    # Luhn 不通过:若长度 16/19 位且首位合法(3-6/8-9 是常见银行卡首位),仍保留
-    # 这样救回 example.csv 里不符合 Luhn 的伪银行卡号
-    if len(val) in (16, 17, 18, 19) and val[0] in "356789":
-        _add("BANK_CARD", val)
+        val = m.group()
+        overlap = any(s <= m.start() < e or s < m.end() <= e
+                      for s, e in found_id_card_spans + found_uscc_spans)
+        if overlap:
+            continue
+        # Luhn 通过 → 直接加
+        if validate_luhn(val):
+            _add("BANK_CARD", val)
+            continue
+        # Luhn 不通过:若长度 16/19 位且首位合法(3-6/8-9 是常见银行卡首位),仍保留
+        # 这样救回 example.csv 里不符合 Luhn 的伪银行卡号
+        if len(val) in (16, 17, 18, 19) and val[0] in "356789":
+            _add("BANK_CARD", val)
 
     for stype, val in _extract_password_candidates(value_str):
         _add(stype, val)

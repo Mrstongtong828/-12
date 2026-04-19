@@ -260,41 +260,48 @@ def _scan_database(db_type, db_name, writer, log):
         conn.close()
 
 
-def _scan_database(db_type, db_name, writer, log: ScanLogger):
-    label = f"{db_type}/{db_name}"
-    conn = get_connection(db_type, db_name)
-    if conn is None:
-        log.error(label, "无法建立连接，跳过")
-        return
+def _scan_table(conn, db_type, db_name, table_name, writer, log: ScanLogger, label: str):
+    import itertools
 
-    try:
-        tables = get_all_tables(conn, db_type, db_name)
-        log.register_db(label, total_tables=len(tables))
-        log.info(label, f"发现 {len(tables)} 张表")
+    pk_col = get_primary_key_col(conn, db_type, db_name, table_name)
+    row_count = 0
+    hit_count = 0
+    local_buffer = []
 
-        for table in tables:
-            if _time_left() <= 0:
-                log.warning(label, "达到总时限，停止")
-                break
-            try:
-                rows, hits = _scan_table(conn, db_type, db_name, table, writer, log, label)
-                log.advance(label, table=table, rows=rows, findings=hits)
-            except Exception as e:
-                log.error(label, f"表 {table} 扫描异常: {e}")
+    is_blob_table = _has_blob_column(conn, db_type, db_name, table_name)
 
-        # 数据库对象（存储过程 + 视图）
-        try:
-            db_obj_findings = scan_db_objects(conn, db_type, db_name)
-            if db_obj_findings:
-                with _writer_lock:
-                    for f in db_obj_findings:
-                        writer.write_row(f)
-                log.info(label, f"db_object 发现 {len(db_obj_findings)} 条")
-        except Exception as e:
-            log.error(label, f"db_object 扫描异常: {e}")
+    estimated = _estimate_row_count(conn, db_type, db_name, table_name)
+    if estimated > SAMPLE_THRESHOLD:
+        row_iter = _sampled_rows(conn, db_type, table_name, pk_col)
+        log.info(label, f"表 {table_name} 估算 {estimated:,} 行，启用分层抽样")
+    else:
+        row_iter = stream_table_rows(conn, db_type, table_name, pk_col)
 
-    finally:
-        conn.close()
+    if is_blob_table:
+        log.info(label, f"表 {table_name} 含 BLOB 列，限制最多扫 {BLOB_TABLE_MAX_ROWS} 行")
+        row_iter = itertools.islice(row_iter, BLOB_TABLE_MAX_ROWS)
+
+    deadline = time.time() + TABLE_TIMEOUT_SECONDS
+    for pk_value, row in row_iter:
+        if time.time() > deadline:
+            log.warning(label, f"表 {table_name} 超时({TABLE_TIMEOUT_SECONDS}s)，已扫 {row_count} 行")
+            break
+        if _time_left() <= 0:
+            log.warning(label, "总时间将耗尽，停止扫描")
+            _flush_buffer(writer, local_buffer)
+            return row_count, hit_count
+
+        for field_name, value in row.items():
+            findings = dispatch(field_name, value, pk_value, table_name, db_type, db_name)
+            if findings:
+                hit_count += len(findings)
+                local_buffer.extend(findings)
+                if len(local_buffer) >= WRITER_BUFFER_SIZE:
+                    _flush_buffer(writer, local_buffer)
+        row_count += 1
+
+    _flush_buffer(writer, local_buffer)
+    return row_count, hit_count
 
 
 def main():
