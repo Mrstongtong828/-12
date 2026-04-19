@@ -81,17 +81,22 @@ def get_connection(db_type: str, db_name: str):
                 connect_timeout=10,
             )
         elif db_type == "postgresql":
-            return psycopg2.connect(
+            conn = psycopg2.connect(
                 host=cfg["host"],
                 port=cfg["port"],
                 user=cfg["user"],
                 password=cfg["password"],
                 dbname=db_name,
                 connect_timeout=10,
+                client_encoding="UTF8",   # 强制 UTF8
             )
-    except Exception as e:
-        print(f"[ERROR] 连接 {db_type}/{db_name} 失败: {e}")
-        return None
+            # 双保险: 有些服务端会忽略连接参数,用 SESSION SET 再压一次
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SET client_encoding TO 'UTF8'")
+            except Exception:
+                pass
+            return conn
 
 
 def get_all_tables(conn, db_type: str, db_name: str) -> list:
