@@ -47,15 +47,15 @@ class CSVWriter:
         if _should_skip(extracted):
             return False
         extracted_stripped = str(extracted).strip()
-        # [dedup-fix] 去重键：基于数据位置 + 值，不含 sensitive_type
-        # 同一敏感值即使被识别为不同类型，也只记录一次（保留首次发现的类型）
+        # 去重键:完全基于数据位置 + 类型 + 值
+        # 同一 (位置, 类型, 值) 只记录一次
         key = (
-                str(row_dict.get("db_type", "")),
-                str(row_dict.get("db_name", "")),
-                str(row_dict.get("table_name", "")),
-                str(row_dict.get("field_name", "")),
-                str(row_dict.get("record_id", "")),
-                str(row_dict.get("sensitive_type", "")),   # 必须保留
+            str(row_dict.get("db_type", "")),
+            str(row_dict.get("db_name", "")),
+            str(row_dict.get("table_name", "")),
+            str(row_dict.get("field_name", "")),
+            str(row_dict.get("record_id", "")),
+            str(row_dict.get("sensitive_type", "")),
             extracted_stripped,
         )
         if key in self._seen:
@@ -64,6 +64,9 @@ class CSVWriter:
         row = dict(row_dict)
         row["extracted_value"] = extracted_stripped
         self._writer.writerow(row)
+        # [防丢] 每写一行立即 flush,防止进程崩溃时丢最后一批行
+        # 性能影响:极小(行数通常 <10 万,单次 flush 在 ms 级)
+        self._file.flush()
         return True
 
     def write_multiple_findings(self, base_row: dict, findings_list: list):
@@ -75,6 +78,10 @@ class CSVWriter:
             self.write_row(row)
 
     def close(self):
+        try:
+            self._file.flush()
+        except Exception:
+            pass
         self._file.close()
 
     def __enter__(self):

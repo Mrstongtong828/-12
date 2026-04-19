@@ -18,10 +18,9 @@ _CP1252_EXTRA = {
 }
 
 
-def _mojibake_to_bytes(s: str):
-    """把 mojibake 字符串映射回它所来自的字节序列。
-    合并 Latin-1（覆盖 0x80-0x9F 控制字节）与 CP1252（覆盖 Š/…/œ 等专用字符）。
-    无法映射的字符返回 None。"""
+def _mojibibake_to_latin1_bytes(s: str) -> bytes:
+    """把 mojibake 字符串中可映射到 Latin-1 的字符提取出来，转换回原始字节。
+    返回字节序列（可能不完整但已尽力恢复）。"""
     out = bytearray()
     for ch in s:
         cp = ord(ch)
@@ -29,8 +28,7 @@ def _mojibake_to_bytes(s: str):
             out.append(cp)
         elif ch in _CP1252_EXTRA:
             out.append(_CP1252_EXTRA[ch])
-        else:
-            return None
+        # 忽略无法映射的字符（如 C1 控制字符 U+0080-U+009F）
     return bytes(out)
 
 
@@ -47,12 +45,14 @@ def _fix_mysql_mojibake(s):
     # 快速过滤：没有任何非 ASCII 字符时直接返回
     if all(ord(ch) < 0x80 for ch in s):
         return s
-    raw = _mojibake_to_bytes(s)
-    if raw is None:
+    # 提取可映射的 Latin-1 字节（尽力而为，忽略无法映射的字符）
+    raw = _mojibibake_to_latin1_bytes(s)
+    if not raw:
         return s
     try:
-        fixed = raw.decode('utf-8', errors='strict')
-    except UnicodeDecodeError:
+        # 用 errors='ignore' 跳过无法解码的字节序列
+        fixed = raw.decode('utf-8', errors='ignore')
+    except Exception:
         return s
     if fixed != s and any(_CJK_RANGE[0] <= ch <= _CJK_RANGE[1] for ch in fixed):
         return fixed

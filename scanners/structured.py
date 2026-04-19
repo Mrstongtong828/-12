@@ -1,7 +1,7 @@
 import json
-# structured.py 顶部的 import 追加一项
-from core.config import SENSITIVE_LEVEL_MAP, LEAF_TEXT_MAX_LEN
 import xml.etree.ElementTree as ET
+
+from core.config import SENSITIVE_LEVEL_MAP, LEAF_TEXT_MAX_LEN
 from core.patterns import (
     extract_sensitive_from_value, match_field_name,
     extract_by_field_hint,
@@ -9,9 +9,8 @@ from core.patterns import (
     is_name_fp_field,              # [FP-fix P0-A]
     _SURNAMES_SET, NAME_BLACKLIST, _FIELD_NAME_COMPILED, _NAME_BLACKLIST_RE,
 )
-from core.config import SENSITIVE_LEVEL_MAP
 
-# 提升到模块级，避免 _walk 递归时每次 lazy import
+# 提升到模块级,避免 _walk 递归时每次 lazy import
 try:
     from scanners.encoded import _is_encoded_value as _enc_check, decode_recursive as _dec_recursive
 except ImportError:
@@ -76,7 +75,6 @@ def scan_json_value(json_str, record_id, table_name, field_col_name, db_type, db
             if len(actual) > LEAF_TEXT_MAX_LEN:
                 actual = actual[:LEAF_TEXT_MAX_LEN]
             for stype, val in extract_sensitive_from_value(actual):
-                # [FP-fix P0-A] 父键是 FP 黑名单字段 → CHINESE_NAME 跳过
                 if stype == "CHINESE_NAME" and is_name_fp_field(effective_field):
                     continue
                 findings.append(_make_finding(
@@ -84,7 +82,7 @@ def scan_json_value(json_str, record_id, table_name, field_col_name, db_type, db
                     record_id, "semi_structured", stype, val,
                 ))
         elif isinstance(obj, (int, float)):
-            # [B1] JSON 数字类型（如 {"phone": 13800138000}）也需扫描
+            # [B1] JSON 数字类型(如 {"phone": 13800138000})也需扫描
             s = str(int(obj)) if isinstance(obj, float) and obj == int(obj) else str(obj)
             for stype, val in extract_sensitive_from_value(s):
                 if stype == "CHINESE_NAME" and is_name_fp_field(effective_field):
@@ -101,11 +99,9 @@ def scan_json_value(json_str, record_id, table_name, field_col_name, db_type, db
                         record_id, "semi_structured", "PASSWORD_OR_SECRET", v,
                     ))
                 else:
-                    # 把 key 传给下一层，让叶子能感知父键
                     _walk(v, parent_key=k)
         elif isinstance(obj, list):
             for item in obj:
-                # 列表元素继承外层的 parent_key（列表本身没名字）
                 _walk(item, parent_key=parent_key)
 
     _walk(data)
@@ -120,7 +116,6 @@ def scan_xml_value(xml_str, record_id, table_name, field_col_name, db_type, db_n
         return findings
 
     def _walk_elem(elem):
-        # [FP-fix P0-A] XML 的 tag 名等价于 JSON 的 key
         tag_name = elem.tag if elem.tag else field_col_name
         if elem.text and elem.text.strip():
             for stype, val in extract_sensitive_from_value(elem.text.strip()):
@@ -147,36 +142,21 @@ def scan_xml_value(xml_str, record_id, table_name, field_col_name, db_type, db_n
 
 def _regex_fallback_scan(value_str, field_name, record_id, table_name,
                         field_col_name, db_type, db_name, data_form):
-    """
-    通用正则兜底扫描逻辑。从 value_str 里提取所有敏感值，并应用：
-      - CHINESE_NAME 保留条件（字段名提示或首字为已知姓氏）
-      - ADDRESS 保留条件（长度 >=15，同时含行政单位和街道词）
-      - extract_by_field_hint（营业执照等只在字段名命中时才识别的类型）
-
-    data_form 由调用方决定：走 semi_structured fallback 时传 "semi_structured"，
-    走默认结构化扫描时传 "structured"。
-    """
     findings = []
-
-    # 只在需要时计算 field_hints（CHINESE_NAME 过滤才用得到）
     field_hints = None
 
     for stype, val in extract_sensitive_from_value(value_str):
         if stype == "CHINESE_NAME":
-            # [FP-fix P0-A] 字段在黑名单里（handler/operator/created_by 等）
-            # 直接跳过所有 CHINESE_NAME 候选
             if is_name_fp_field(field_name):
                 continue
             if field_hints is None:
                 field_hints = match_field_name(field_name)
             if "CHINESE_NAME" not in field_hints:
-                # 字段名未命中时，要求首字为已知姓氏且不在黑名单
                 if not (len(val) >= 2
                         and val[0] in _SURNAMES_SET
                         and not _NAME_BLACKLIST_RE.search(val)):
                     continue
         elif stype == "ADDRESS":
-            # [fix #8] 用统一函数，strict=True（结构化字段要求严格）
             if not is_valid_address(val, strict=True):
                 continue
 
@@ -185,7 +165,6 @@ def _regex_fallback_scan(value_str, field_name, record_id, table_name,
             record_id, data_form, stype, val,
         ))
 
-    # [新增] 字段名命中时才触发的敏感类型（当前为 BUSINESS_LICENSE_NO）
     for stype, val in extract_by_field_hint(field_name, value_str):
         findings.append(_make_finding(
             db_type, db_name, table_name, field_col_name,
@@ -204,7 +183,6 @@ def scan_structured_field(field_name, value, record_id, table_name,
     if not value_str:
         return []
 
-    # 密码字段：整值即为敏感值
     if _is_password_field(field_name):
         return [_make_finding(
             db_type, db_name, table_name, field_col_name,
@@ -213,7 +191,6 @@ def scan_structured_field(field_name, value, record_id, table_name,
 
     data_form = _detect_form(value_str)
 
-    # ── 半结构化分支 ──────────────────────────────────────────────
     if data_form == "semi_structured":
         s = value_str.strip()
         if s.startswith("<"):
@@ -224,15 +201,12 @@ def scan_structured_field(field_name, value, record_id, table_name,
                                       field_col_name, db_type, db_name)
         if results:
             return results
-        # [bug #4 修复] 解析失败时 fallback 走正则，但保留 semi_structured 标签，
-        # 否则伪 JSON/XML 串会被错误分类到 structured 形态，TP 全变 FP+FN
         return _regex_fallback_scan(
             value_str, field_name, record_id, table_name,
             field_col_name, db_type, db_name,
             data_form="semi_structured",
         )
 
-    # ── 结构化默认分支 ────────────────────────────────────────────
     return _regex_fallback_scan(
         value_str, field_name, record_id, table_name,
         field_col_name, db_type, db_name,
