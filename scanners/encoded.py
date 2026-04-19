@@ -1,16 +1,38 @@
+"""
+编码/变形数据扫描器。
+
+关键改动(基于 example.csv 分析):
+  1. 引入 _STRONG_ENCODED_FIELD_RE:字段名含 encoded_xxx / payload / base64
+     等强提示时,绕开 _is_encoded_value 启发式,无条件跑 decode_recursive。
+     理由: example 里 encoded 形态全部字段名都是 encoded_rx/encoded_report/
+     encoded_payload,启发式判断第一层解码不够直接可能漏。
+  2. _decoded_looks_sensitive 扩展了强 pattern 列表,覆盖医保号/病历号/
+     公积金号/社保号/车牌/VIN/USCC/护照等有结构先验的类型。
+  3. decode_recursive 四重防御(深度/单步长度/循环自指/累计膨胀比)。
+"""
 import re
 import base64
 import urllib.parse
 from core.patterns import extract_sensitive_from_value, REGEX_PATTERNS
 from core.config import SENSITIVE_LEVEL_MAP
 
+
+# ── 解码链防御上限 ────────────────────────────────────────────────
 MAX_DECODE_DEPTH = 5          # 递归深度上限
 MAX_DECODED_LEN = 200_000     # 单步解码后长度上限
 MAX_CUMULATIVE_RATIO = 10     # 累计膨胀比(末值长度 / 初始长度)
 
 
+# ── 字段名黑名单 / 白名单 ────────────────────────────────────────
 PASSWORD_FIELD_KEYWORDS = {"password", "passwd", "pwd", "secret", "token",
                             "api_key", "apikey", "private_key", "secret_key"}
+
+# [新] 字段名强提示 encoded 形态。命中则绕开 _is_encoded_value 启发式。
+_STRONG_ENCODED_FIELD_RE = re.compile(
+    r"(?:encoded[_\w]*|payload|base64|encode|cipher|ciphertext|encrypted)",
+    re.IGNORECASE,
+)
+
 
 # ── 模块级预编译正则 ──────────────────────────────────────────────
 _HAS_LETTER = re.compile(r"[a-zA-Z]")
@@ -18,9 +40,9 @@ _HAS_AF = re.compile(r"[a-fA-F]")
 _HAS_CHINESE = re.compile(r"[\u4e00-\u9fa5]")
 _UNICODE_ESC = re.compile(r"\\u[0-9a-fA-F]{4}")
 _PERCENT_ENC = re.compile(r"%[0-9a-fA-F]{2}")
-# 快速预检：base64 合法字符集（fix P4，避免对非 base64 串走完整解码）
+# 快速预检:base64 合法字符集(避免对非 base64 串走完整解码)
 _B64_CHARS = re.compile(r"^[A-Za-z0-9+/\-_=]+$")
-# 快速预检：hex 合法字符集
+# 快速预检:hex 合法字符集
 _HEX_CHARS = re.compile(r"^[0-9a-fA-F]+$")
 
 
@@ -43,14 +65,14 @@ def _try_url_decode(s: str):
 
 def _try_base64_decode(s: str):
     stripped = s.strip()
-    # 快速预检：长度至少8，必须含字母，字符全在 base64 合法集内（fix P4）
+    # 快速预检:长度至少 8,必须含字母,字符全在 base64 合法集内
     if len(stripped) < 8:
         return None
     if not _HAS_LETTER.search(stripped):
         return None
     if not _B64_CHARS.match(stripped.rstrip("=")):
         return None
-    # 支持 URL-safe base64（fix FN3）
+    # 支持 URL-safe base64
     is_urlsafe = ("-" in stripped or "_" in stripped)
     try:
         padded = stripped + "=" * (-len(stripped) % 4)
@@ -75,7 +97,7 @@ _IMAGE_MAGIC = (
 
 
 def try_base64_as_image(s: str):
-    """若 s 是 base64 编码的图片数据，返回原始字节；否则返回 None。"""
+    """若 s 是 base64 编码的图片数据,返回原始字节;否则返回 None。"""
     stripped = s.strip()
     if len(stripped) < 100:
         return None
@@ -99,7 +121,7 @@ def try_base64_as_image(s: str):
 
 def _try_hex_decode(s: str):
     stripped = s.strip()
-    # 快速预检（fix P4）
+    # 快速预检
     if len(stripped) < 8 or len(stripped) % 2 != 0:
         return None
     if not _HAS_AF.search(stripped):
@@ -116,7 +138,7 @@ def _try_hex_decode(s: str):
 
 
 def _try_unicode_unescape(s: str):
-    """修复原 unicode_escape codec 对中文字符乱码的问题（fix B2）。"""
+    """修复 unicode_escape codec 对中文字符乱码的问题。"""
     if not _UNICODE_ESC.search(s):
         return None
     try:
@@ -129,14 +151,15 @@ def _try_unicode_unescape(s: str):
     except Exception:
         return None
 
+
 def decode_recursive(value_str: str, max_rounds: int = MAX_DECODE_DEPTH):
     """
     递归解码链,带四重防御:
-      1. 深度上限: max_rounds 轮
-      2. 单步长度上限: 解码后 > MAX_DECODED_LEN → 截停
-      3. 循环自指检测: 中间串已见过 → 截停
-      4. 累计膨胀比上限: 末值/初值 > MAX_CUMULATIVE_RATIO → 截停
-    任何一闸触发都静默停止,返回当前最后合法结果 + 已完成的 chain。
+      闸1: 深度上限 max_rounds 轮
+      闸2: 单步解码后长度 > MAX_DECODED_LEN → 截停(防 zip-bomb 式膨胀)
+      闸3: 循环自指(本轮解码结果已出现在 seen 里)→ 截停
+      闸4: 末值 / 初值 > MAX_CUMULATIVE_RATIO → 截停
+    任一闸触发都静默返回当前最后合法结果 + 已完成的 chain,不抛异常。
     """
     current = value_str
     chain = []
@@ -176,24 +199,24 @@ def decode_recursive(value_str: str, max_rounds: int = MAX_DECODE_DEPTH):
 
     return current, chain
 
+
 def _decoded_looks_sensitive(decoded: str) -> bool:
     """
     判断解码结果是否"看起来有价值"。
     扩展:纳入所有有强先验结构的类型,避免 encoded+医保号 等被判成 structured。
-    - 含中文 → 一定有价值
-    - 命中强 pattern → 一定有价值
+      - 含中文 → 一定有价值
+      - 命中强 pattern → 一定有价值
     """
     if not decoded:
         return False
     if _HAS_CHINESE.search(decoded):
         return True
-    # 扩展:所有自带结构校验或特定前缀的类型都算"强特征"
+    # 所有自带结构校验或特定前缀的类型都算"强特征"
     strong_patterns = (
         "PHONE_NUMBER", "EMAIL", "ID_CARD", "BANK_CARD",
         "ADDRESS", "IP_ADDRESS", "GPS_COORDINATE",
-        # ── 以下为新增 ──────────────────────────────────
-        "MEDICAL_INSURANCE_NO",   # YB + 14-16 位,前缀强特征
-        "MEDICAL_RECORD_NO",      # MR + 9 位,前缀强特征
+        "MEDICAL_INSURANCE_NO",   # YB + 14-16 位,前缀强
+        "MEDICAL_RECORD_NO",      # MR + 9 位,前缀强
         "HOUSING_FUND_NO",        # 2 字母 + 20/21/... + 8 位,前缀强
         "SOCIAL_SECURITY_NO",     # 省份简称 + 2 字母 + 8 位,前缀强
         "LICENSE_PLATE",          # 省份汉字 + 字母数字,前缀强
@@ -208,27 +231,26 @@ def _decoded_looks_sensitive(decoded: str) -> bool:
     return False
 
 
-
 def _is_encoded_value(s: str) -> bool:
     if not s or not isinstance(s, str):
         return False
     stripped = s.strip()
-    # 纯数字不视为编码（手机号/身份证等）
+    # 纯数字不视为编码(手机号/身份证等)
     if stripped.isdigit():
         return False
 
-    # URL 编码 / Unicode 转义：特征明显，直接通过
+    # URL 编码 / Unicode 转义:特征明显,直接通过
     if _PERCENT_ENC.search(stripped):
         return True
     if _UNICODE_ESC.search(stripped):
         return True
 
-    # [fix #9] base64：除了能解码外，还要求解码结果"看起来有价值"
+    # base64:除了能解码外,还要求解码结果"看起来有价值"
     decoded_b64 = _try_base64_decode(stripped)
     if decoded_b64 is not None and _decoded_looks_sensitive(decoded_b64):
         return True
 
-    # [fix #9] hex：同样要求解码后有价值
+    # hex:同样要求解码后有价值
     decoded_hex = _try_hex_decode(stripped)
     if decoded_hex is not None and _decoded_looks_sensitive(decoded_hex):
         return True
@@ -252,8 +274,9 @@ def _make_finding(db_type, db_name, table_name, field_col_name,
     }
 
 
-def _scan_decoded(decoded: str, record_id, table_name, field_col_name, db_type, db_name) -> list:
-    """解码后扫描：先尝试 JSON/XML，再走正则（fix B4）。"""
+def _scan_decoded(decoded: str, record_id, table_name, field_col_name,
+                  db_type, db_name) -> list:
+    """解码后扫描:先尝试 JSON/XML,再走正则。"""
     findings = []
     seen = set()
 
@@ -302,6 +325,16 @@ def _scan_decoded(decoded: str, record_id, table_name, field_col_name, db_type, 
 
 def scan_encoded_field(field_name, raw_value, record_id, table_name,
                         field_col_name, db_type, db_name):
+    """
+    编码字段扫描。
+    策略:
+      A. 密码字段 → 跳过(由 dispatcher 层 PASSWORD_FIELD 处理)
+      B. 字段名强提示为 encoded_xxx / payload / base64 等
+         → 无条件 decode_recursive,不看 _is_encoded_value 启发式
+         理由: example.csv 里 encoded 形态的字段名全部带 encoded_ 前缀,
+         启发式判断对多层嵌套编码不稳;字段名是强信号应当直接信任。
+      C. 否则走原有 _is_encoded_value 启发式判断
+    """
     if not raw_value or not isinstance(raw_value, str):
         return []
 
@@ -309,11 +342,20 @@ def scan_encoded_field(field_name, raw_value, record_id, table_name,
     if any(kw in fn for kw in PASSWORD_FIELD_KEYWORDS):
         return []
 
-    if not _is_encoded_value(raw_value):
-        return []
+    # [新] 字段名强提示 → 绕开 _is_encoded_value 启发式
+    strong_field = bool(_STRONG_ENCODED_FIELD_RE.search(fn))
+
+    if not strong_field:
+        if not _is_encoded_value(raw_value):
+            return []
 
     decoded, chain = decode_recursive(raw_value)
     if not chain or decoded == raw_value:
+        # 解码失败。
+        # - 启发式路径(非强字段):本来就不该有命中,直接返空
+        # - 强字段路径:value 可能是明文 key:value(如 "BANK:xxx|PHONE:yyy"),
+        #   dispatcher 的 5a 会兜底走 structured + data_form=encoded,这里返空
+        #   不冲突(dispatcher 见 hits 为空会继续到 5a)
         return []
 
     return _scan_decoded(decoded, record_id, table_name, field_col_name, db_type, db_name)
