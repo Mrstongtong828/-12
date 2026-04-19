@@ -178,24 +178,35 @@ def decode_recursive(value_str: str, max_rounds: int = MAX_DECODE_DEPTH):
 
 def _decoded_looks_sensitive(decoded: str) -> bool:
     """
-    [fix #9] 判断解码结果是否"看起来有价值"：
-      - 含中文 → 一定是真编码（敏感数据通常含中文）
-      - 含手机号/邮箱/身份证等强特征 → 很可能是真编码
-
-    这样可以避免把正常的英文长串（UUID、哈希、token 本身）
-    误判为"已编码"然后产生不可预测的 FP。
+    判断解码结果是否"看起来有价值"。
+    扩展:纳入所有有强先验结构的类型,避免 encoded+医保号 等被判成 structured。
+    - 含中文 → 一定有价值
+    - 命中强 pattern → 一定有价值
     """
     if not decoded:
         return False
     if _HAS_CHINESE.search(decoded):
         return True
-    # 至少命中一个强模式才认为是真编码
-    strong_patterns = ("PHONE_NUMBER", "EMAIL", "ID_CARD", "BANK_CARD",
-                       "ADDRESS", "IP_ADDRESS", "GPS_COORDINATE")
+    # 扩展:所有自带结构校验或特定前缀的类型都算"强特征"
+    strong_patterns = (
+        "PHONE_NUMBER", "EMAIL", "ID_CARD", "BANK_CARD",
+        "ADDRESS", "IP_ADDRESS", "GPS_COORDINATE",
+        # ── 以下为新增 ──────────────────────────────────
+        "MEDICAL_INSURANCE_NO",   # YB + 14-16 位,前缀强特征
+        "MEDICAL_RECORD_NO",      # MR + 9 位,前缀强特征
+        "HOUSING_FUND_NO",        # 2 字母 + 20/21/... + 8 位,前缀强
+        "SOCIAL_SECURITY_NO",     # 省份简称 + 2 字母 + 8 位,前缀强
+        "LICENSE_PLATE",          # 省份汉字 + 字母数字,前缀强
+        "VIN_CODE",               # 17 位特定字符集
+        "USCC",                   # 18 位混合,有校验位
+        "PASSPORT",               # [EGDPS] + 8 位数字
+    )
     for p_name in strong_patterns:
-        if REGEX_PATTERNS[p_name].search(decoded):
+        pat = REGEX_PATTERNS.get(p_name)
+        if pat is not None and pat.search(decoded):
             return True
     return False
+
 
 
 def _is_encoded_value(s: str) -> bool:
