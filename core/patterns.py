@@ -143,11 +143,25 @@ _NAME_TRAIL_JOB_HEADS = frozenset([
 
 # [Fix #1] 动词 bigram —— 若候选名末尾 2 字 ∈ 这里，说明贪婪吃进动词短语。
 # 比如 "孙继续跟进"（孙是姓）产生 3 字候选 "孙继续"，末尾 `继续` ∈ bigrams → 弃。
+# 也覆盖 4 字候选 "翟琸来电" 中末 2 字 "来电" → 弃。
 _NAME_FOLLOW_VERB_BIGRAMS = frozenset([
+    # 原有
     "反映", "反馈", "继续", "处理", "办理", "审查", "审核", "提交",
     "通知", "更新", "提供", "咨询", "投诉", "举报", "跟进", "欺诈",
     "告知", "询问", "拒绝", "承认", "表示", "答复", "回复", "上报",
     "解决", "配合", "确认", "申请", "申报", "退款", "退货",
+    # [Name-bigram扩容] 业务短语常见：
+    "来电", "来访", "来店", "来人", "来信",       # 来X
+    "报案", "报名", "报到", "报警", "报修",       # 报X
+    "到场", "到访", "到店",                       # 到X
+    "取消", "取件", "取货",                       # 取X
+    "送达", "送到",                               # 送X
+    "入院", "入住", "入职",                       # 入X
+    "出院", "出差", "出院",                       # 出X
+    "离职", "离店",                               # 离X
+    "前往", "前来",                               # 前X
+    "希望", "要求", "请求",                       # 希/要/请X
+    "同意", "不同",                               # 同X
 ])
 
 
@@ -194,6 +208,13 @@ def try_name_at(text: str, i: int):
         # 候选中任意相邻 2 字构成动词短语（反映/继续/欺诈 ...）→ 弃
         if _contains_verb_bigram(cand):
             continue
+        # [Fix-3字吞字] 候选末字 + 后面一字是否构成动词 bigram（来电/反馈/咨询...）
+        # 例："翟琸来" + "电" → "来电" 在 bigram → 候选把动词首字吞了 → 弃 3 字候选
+        # 4 字同理，但 4 字已经在 _NAME_TAIL_SPILLOVER 覆盖过（反/先 等首字在集合里）
+        if L == 3 and i + L < n:
+            spill_bigram = cand[-1] + text[i + L]
+            if spill_bigram in _NAME_FOLLOW_VERB_BIGRAMS:
+                continue
         # 4 字末尾溢出保护
         if L == 4:
             next_char = text[i+L] if i+L < n else ''
@@ -488,6 +509,88 @@ _ADDR_TAIL_WORDS = (
     "街", "路", "道", "里", "苑", "区", "厂", "所", "层",
 )
 
+# ── [Addr-Clean] 地址前缀清洗 ────────────────────────────────────
+# 证据：当前 ADDRESS_RE 会把"我家在辽宁省沈阳市..."整段吞成命中值，导致
+# extracted_value 不等于答案精确字符串。
+# 策略：命中后做 post-trim（不改正则，零风险），分两层：
+#   ① 剥已知介词/label（按最长匹配降序）
+#   ② 若首部仍不是行政区划，就切到第一个"省/直辖市/自治区"锚点（前缀 <=8 字时切，
+#      避免把"北京烤鸭店真好吃在东直门"这种非地址误切）
+_ADDR_INTRO_PREFIXES = (
+    # 介词短语（动词/动宾）—— 长度降序放在最前面
+    "我家在", "我家住", "我现在住", "我目前住", "我住",
+    "家住", "家在", "住在", "现住", "现居", "现在住",
+    "位于", "地处", "坐落于", "坐落在",
+    "居住于", "居住在",
+    # label 变体（和 _ADDR_LABEL_PREFIXES 重叠也没关系，在不同场景用）
+    "家庭地址是", "家庭地址为", "家庭地址",
+    "住址是", "住址为",
+    "地址是", "地址为",
+    "现住址", "家庭住址", "联系地址", "通讯地址", "户籍地址", "居住地址",
+    "收货地址", "详细地址", "办公地址", "单位地址",
+    "住址", "地址",
+    # 英文 label
+    "address:", "addr:", "location:",
+    "address", "addr",
+)
+
+# 行政区划锚点（省/直辖市/自治区）—— 用精确列表避免贪婪匹配
+# 不能用 `[\u4e00-\u9fa5]{2,4}省` —— 会把"家在辽宁"识别成 4 字省名
+_ADDR_ADMIN_ANCHOR = re.compile(
+    "(?:"
+    # 4 个直辖市
+    "北京市|上海市|天津市|重庆市|"
+    # 23 省
+    "河北省|山西省|辽宁省|吉林省|黑龙江省|江苏省|浙江省|安徽省|福建省|江西省|"
+    "山东省|河南省|湖北省|湖南省|广东省|海南省|四川省|贵州省|云南省|陕西省|"
+    "甘肃省|青海省|台湾省|"
+    # 5 自治区
+    "内蒙古自治区|广西壮族自治区|西藏自治区|宁夏回族自治区|新疆维吾尔自治区|"
+    # 2 特别行政区
+    "香港特别行政区|澳门特别行政区"
+    ")"
+)
+
+# 清洗后首部可切掉的最大字符数（>8 字就放弃，避免误切）
+_ADDR_ANCHOR_MAX_PREFIX = 8
+
+
+def clean_address_prefix(addr: str) -> str:
+    """
+    去掉地址开头的介词/label，保留核心地址。
+    安全设计：
+      - 仅当清洗后非空时替换（防止把整值洗空）
+      - 仅当清洗前后都满足长度/结构校验时替换（失败就保持原值）
+    """
+    if not addr:
+        return addr
+    s = addr.strip()
+    original = s
+
+    # ① 剥已知前缀，最长匹配优先；最多 5 轮防死循环
+    for _ in range(5):
+        stripped = None
+        for p in sorted(_ADDR_INTRO_PREFIXES, key=len, reverse=True):
+            if s.lower().startswith(p.lower()):
+                cand = s[len(p):].lstrip(" :：\t")
+                if cand:
+                    stripped = cand
+                break
+        if stripped is None:
+            break
+        s = stripped
+
+    # ② 仍不是行政区划打头？切到第一个省/直辖市/自治区锚点
+    #    前缀 >_ADDR_ANCHOR_MAX_PREFIX 字则不动（避免误切非地址）
+    m = _ADDR_ADMIN_ANCHOR.search(s)
+    if m and 0 < m.start() <= _ADDR_ANCHOR_MAX_PREFIX:
+        s = s[m.start():]
+
+    # 安全网：若清洗结果和原值区别很大（超过 4 字）但清洗后反而变短到很极端，保留原值
+    if not s or len(s) < 10:
+        return original
+    return s
+
 
 def extract_sensitive_from_value(value_str: str) -> list:
     if not value_str or not isinstance(value_str, str):
@@ -558,12 +661,12 @@ def extract_sensitive_from_value(value_str: str) -> list:
                 continue
         i += 1
 
-    # ── ADDRESS：长度 + [P0-C] label 前缀拒绝 ──────────────────────
+    # ── ADDRESS：[Addr-Clean] 先清洗前缀，再做长度/label 校验 ──────
     for m in REGEX_PATTERNS["ADDRESS"].finditer(value_str):
-        addr = m.group()
+        addr = clean_address_prefix(m.group())
         if len(addr) < 10:
             continue
-        # [P0-C] 整值以 label 开头 → 正则贪婪吞进了标签，丢弃
+        # 清洗后若仍以 label 开头（清洗失败），丢弃
         low = addr.lower()
         if any(low.startswith(p.lower()) for p in _ADDR_LABEL_PREFIXES):
             continue

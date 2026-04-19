@@ -21,6 +21,7 @@ from core.patterns import (
     extract_sensitive_from_value, _SURNAMES_SET, COMPOUND_SURNAMES, NAME_BLACKLIST,
     _NAME_BLACKLIST_RE, _NAME_ADDR_CHARS,
     is_valid_address,
+    clean_address_prefix,         # [Addr-Clean]
     is_name_fp_field,              # [P0-A]
     is_job_title_name,             # [P0-B]
     _is_verbish_name,              # [P0-D]
@@ -78,7 +79,11 @@ def get_uie_engine():
 # 模块级预编译
 _NAME_TRIGGER = re.compile(
     r"(?:叫|名叫|姓名|姓名为|名字|名为|联系人|负责人|经手人|申请人|代理人|"
-    r"用户|客户|顾客|乘客|接待|办理|来电|反馈|咨询|投诉|患者|申报人)"
+    r"用户|客户|顾客|乘客|接待|办理|来电|反馈|咨询|投诉|患者|申报人|"
+    # [Name-2字扩容] 让"翟琸来电"/"居黎咨询"这类 2 字名能被后置触发词命中。
+    # 注意：_NAME_TRIGGER 目前只检查 name **之前**的 10 字窗口——加的是"触发词 +
+    # 名字"顺序；"名字 + 触发词"是另一种顺序，属独立改动未做。
+    r"反馈者|报案人|诉求人|咨询人|办理人|来电人|投诉人|申报者)"
 )
 _ENCODED_HINT = re.compile(
     r"^[A-Za-z0-9+/=]{20,}$|%[0-9A-Fa-f]{2}|\\u[0-9a-fA-F]{4}"
@@ -159,13 +164,18 @@ def _scan_chinese_names(text: str) -> list:
             i += consumed
             continue
 
-        # 再试 2 字名（需前置触发词）
+        # 再试 2 字名（需触发词上下文）
         if i + 2 <= n:
             cand = text[i:i+2]
             if (all('\u4e00' <= ch <= '\u9fa5' for ch in cand)
                     and _is_valid_name_shape(cand)):
-                ctx_start = max(0, i - 10)
-                if _NAME_TRIGGER.search(text[ctx_start:i]):
+                # [2字名] 接受两种触发方向：
+                #   ① 前置触发词：客户/申请人/姓名 叫 xxx → 窗口 = [i-10, i)
+                #   ② 后置触发词：xxx 来电/咨询/反馈 → 窗口 = [i+2, i+12)
+                # 任一方向命中即接受。
+                ctx_before = text[max(0, i - 10):i]
+                ctx_after  = text[i + 2:min(n, i + 12)]
+                if _NAME_TRIGGER.search(ctx_before) or _NAME_TRIGGER.search(ctx_after):
                     if cand not in emitted:
                         emitted.add(cand)
                         results.append(("CHINESE_NAME", cand))
@@ -177,11 +187,13 @@ def _scan_chinese_names(text: str) -> list:
 
 def _scan_addresses(text: str) -> list:
     # 长文本中地址常被分词打断，放宽长度到 10；核心校验由 is_valid_address 统一做
-    return [
-        ("ADDRESS", m.group())
-        for m in _ADDRESS_RE.finditer(text)
-        if is_valid_address(m.group(), strict=False)
-    ]
+    # [Addr-Clean] 命中后调用 clean_address_prefix 剥掉"我家在/家住/现居/..."
+    results = []
+    for m in _ADDRESS_RE.finditer(text):
+        addr = clean_address_prefix(m.group())
+        if is_valid_address(addr, strict=False):
+            results.append(("ADDRESS", addr))
+    return results
 
 
 # UIE schema 实体类型 → sensitive_type 映射
