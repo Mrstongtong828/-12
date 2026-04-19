@@ -1,21 +1,10 @@
 """
 OCR 子进程客户端。
-
-职责:
-  - 维护一个长驻 ocr_worker 子进程
-  - 按长度前缀协议发送图片、接收 OCR 文本
-  - 读 / 写超时用后台线程 + join 超时实现(跨平台)
-  - 子进程崩溃(BrokenPipe / 短读)时自动重启
-  - 熔断:连续 MAX_CONSEC_FAIL 次失败后,本轮扫描禁用 OCR
-           (避免对每张图都重建一次 Paddle 白白浪费 30min 时间预算)
-
-对外 API(和旧 blob.py 兼容):
-  get_ocr_text(image_bytes) -> str | None
-    返回识别文本;None 表示失败(被熔断或子进程挂了)
-
-注意:
-  import 此模块不会启动子进程。第一次调用 get_ocr_text 才会 spawn。
-  程序结束前应调用 shutdown_ocr() 主动关闭 worker。
+改动要点:
+  - PER_IMAGE_TIMEOUT_SEC 45→25
+  - MAX_CONSEC_FAIL 3→2, 熔断更早触发
+  - 修 BUG: 每次 re-spawn 后首次调用使用 SPAWN_TIMEOUT_SEC,而不是被
+    _first_call 这个"整个 client 生命周期里只用一次"的标记压回 25s
 """
 import os
 import sys
@@ -23,10 +12,9 @@ import threading
 import subprocess
 import atexit
 
-# ── 调优参数 ─────────────────────────────────────────────────────
-PER_IMAGE_TIMEOUT_SEC = 45      # 单张 OCR 最长等待时间
-SPAWN_TIMEOUT_SEC = 60          # 首次启动(含模型加载)最长等待时间
-MAX_CONSEC_FAIL = 3             # 连续失败 N 次触发熔断
+PER_IMAGE_TIMEOUT_SEC = 25      # 从 45 下调
+SPAWN_TIMEOUT_SEC = 60
+MAX_CONSEC_FAIL = 2             # 从 3 下调
 WORKER_MODULE = "scanners.ocr_worker"
 
 
@@ -35,28 +23,23 @@ class _OCRClient:
         self._proc = None
         self._lock = threading.Lock()
         self._consec_fail = 0
-        self._disabled = False       # 熔断后置 True,本轮不再重试
-        self._first_call = True
+        self._disabled = False
+        # [改] 不再用 _first_call,改为"本次 request 是否刚 spawn"标记
+        self._just_spawned = False
 
-    # ── 子进程管理 ───────────────────────────────────────────────
     def _spawn(self):
-        """启动新 worker。失败抛异常。"""
-        # bufsize=0: 主进程侧 stdin/stdout 无缓冲,二进制协议不会错位
-        # -u       : 子进程侧 stdout 无缓冲
         self._proc = subprocess.Popen(
             [sys.executable, "-u", "-m", WORKER_MODULE],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            # stderr 不接,让子进程的错误信息直接输出到终端,便于观察
             stderr=None,
             bufsize=0,
             cwd=os.getcwd(),
-            # Windows 下不开 shell
             shell=False,
         )
+        self._just_spawned = True   # 新 worker 第一次调用需要长超时
 
     def _kill_locked(self):
-        """加锁状态下杀掉子进程。"""
         if self._proc is None:
             return
         try:
@@ -71,16 +54,11 @@ class _OCRClient:
         self._proc = None
 
     def _ensure_alive_locked(self):
-        """加锁状态下确保 worker 存活,必要时重启。"""
         if self._proc is not None and self._proc.poll() is None:
             return
         self._spawn()
 
-    # ── 单次请求(加锁) ─────────────────────────────────────────
-    def _request(self, image_bytes: bytes, timeout: float):
-        """
-        发一张图,返回 OCR 文本。失败返 None(上层决定是否熔断)。
-        """
+    def _request(self, image_bytes: bytes):
         with self._lock:
             try:
                 self._ensure_alive_locked()
@@ -88,9 +66,11 @@ class _OCRClient:
                 print(f"[OCR] 子进程启动失败: {e}", flush=True)
                 return None
 
-            proc = self._proc
+            # [改] 根据是否刚 spawn 动态选择超时
+            timeout = SPAWN_TIMEOUT_SEC if self._just_spawned else PER_IMAGE_TIMEOUT_SEC
+            self._just_spawned = False
 
-            # ── 发送 ─────────────────────────────────────────────
+            proc = self._proc
             try:
                 header = len(image_bytes).to_bytes(4, "big")
                 proc.stdin.write(header)
@@ -101,14 +81,13 @@ class _OCRClient:
                 self._kill_locked()
                 return None
 
-            # ── 接收(子线程 + join 超时) ───────────────────────
             holder = {"text": None, "error": None}
 
             def _reader():
                 try:
                     hdr = proc.stdout.read(4)
                     if not hdr or len(hdr) != 4:
-                        holder["error"] = "short header"
+                        holder["error"] = "short header (worker exited)"
                         return
                     n = int.from_bytes(hdr, "big")
                     if n == 0:
@@ -130,7 +109,6 @@ class _OCRClient:
             t.join(timeout)
 
             if t.is_alive():
-                # 超时,worker 要么死锁要么太慢,杀掉
                 print(f"[OCR] 等待响应超时 {timeout}s,杀掉子进程", flush=True)
                 self._kill_locked()
                 return None
@@ -142,17 +120,13 @@ class _OCRClient:
 
             return holder["text"]
 
-    # ── 对外接口 ─────────────────────────────────────────────────
     def get_text(self, image_bytes: bytes):
         if self._disabled:
             return None
         if not image_bytes:
             return None
 
-        timeout = SPAWN_TIMEOUT_SEC if self._first_call else PER_IMAGE_TIMEOUT_SEC
-        self._first_call = False
-
-        text = self._request(image_bytes, timeout)
+        text = self._request(image_bytes)
 
         if text is None:
             self._consec_fail += 1
@@ -184,14 +158,10 @@ class _OCRClient:
             self._proc = None
 
 
-# ── 模块级单例 ───────────────────────────────────────────────────
 _client = _OCRClient()
 
 
 def get_ocr_text(image_bytes):
-    """
-    返回 OCR 识别结果字符串;失败或被熔断返 None。
-    """
     if isinstance(image_bytes, memoryview):
         image_bytes = bytes(image_bytes)
     if isinstance(image_bytes, bytearray):
@@ -202,14 +172,11 @@ def get_ocr_text(image_bytes):
 
 
 def shutdown_ocr():
-    """程序结束前调用,清理 worker。"""
     _client.shutdown()
 
 
 def ocr_disabled() -> bool:
-    """当前是否已被熔断。"""
     return _client._disabled
 
 
-# 进程退出时兜底关闭子进程
 atexit.register(shutdown_ocr)
