@@ -21,6 +21,7 @@ from core.config import (
     DB_CONFIGS, OUTPUT_CSV, MAX_SCAN_MINUTES, TABLE_TIMEOUT_SECONDS,
     SAMPLE_THRESHOLD, SAMPLE_ROWS_PER_TABLE,
     DB_WORKERS, WRITER_BUFFER_SIZE,
+    BLOB_TABLE_MAX_ROWS,
 )
 from core.db_connector import (
     get_connection, get_all_tables, get_primary_key_col, stream_table_rows,
