@@ -50,11 +50,12 @@ class CSVWriter:
         # [dedup-fix] 去重键：基于数据位置 + 值，不含 sensitive_type
         # 同一敏感值即使被识别为不同类型，也只记录一次（保留首次发现的类型）
         key = (
-            str(row_dict.get("db_type", "")),
-            str(row_dict.get("db_name", "")),
-            str(row_dict.get("table_name", "")),
-            str(row_dict.get("field_name", "")),
-            str(row_dict.get("record_id", "")),
+                str(row_dict.get("db_type", "")),
+                str(row_dict.get("db_name", "")),
+                str(row_dict.get("table_name", "")),
+                str(row_dict.get("field_name", "")),
+                str(row_dict.get("record_id", "")),
+                str(row_dict.get("sensitive_type", "")),   # 必须保留
             extracted_stripped,
         )
         if key in self._seen:

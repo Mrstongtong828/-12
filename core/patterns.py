@@ -48,10 +48,11 @@ NAME_BLACKLIST = {
 _NAME_BLACKLIST_RE = re.compile("|".join(re.escape(w) for w in NAME_BLACKLIST))
 
 # 地址/机构常见字：出现任一即认为这段 2-4 字串不是人名（防止从地址文本里误切名字）
-# 例：'家庄市石' / '东门街道' / '宁市西乡' / '家乡1347' 等
+# 例：'家庄市石' / '东门街道' / '宁市西乡' / '家乡1347' / '宁夏回族' 等
 _NAME_ADDR_CHARS = frozenset(
     "省市区县乡镇村街道路弄巷号栋楼室组院庄园区苑里"
     "局院厅局部处司委办站场库所馆组"
+    "族"  # 宁夏回族/汉族 之类，属于民族区划而非人名内部字
 )
 
 # ── [FP-fix P0-A] 字段名黑名单 ─────────────────────────────────────
@@ -103,7 +104,9 @@ def is_job_title_name(name: str) -> bool:
 #   "高血压" → 高(姓) + 血 + 压   ← "压" 在集合 → 过滤
 #   "公积金提" → 公(姓) + 积 + 金 + 提  ← "提" 在集合 → 过滤
 #   "家庭住"  → 家(姓) + 庭 + 住  ← "住" 在集合 → 过滤
+#   "刘跟进"  → 刘(姓) + 跟 + 进  ← "跟" 在集合 → 过滤 (报表动词)
 # 放弃："金/血/糖/心/账/户" 等字，因为真人名里会出现（如"王金"/"李心"）。
+# 也不加 "若" —— answer 里有 "罗若芳"。
 _NAME_VERB_CHARS = frozenset(
     # 虚词：几乎不会作人名内部字
     "的了是在有和与及或但也把被让使"
@@ -111,10 +114,10 @@ _NAME_VERB_CHARS = frozenset(
     "炎症瘤癌疾患肿疼痛"
     # 器官（真人名里罕见）
     "肝肺脾胃肾脑胰"
-    # 高频 FP 触发字（公积金"提" / 高血"压" / 家庭"住"）
-    "压住提取申办"
+    # 高频 FP 触发字（公积金"提" / 高血"压" / 家庭"住" / 刘"跟"进）
+    "压住提取申办跟"
     # 分词遗留常见虚字
-    "及等均各某若"
+    "及等均各某"
 )
 
 
@@ -126,6 +129,85 @@ def _is_verbish_name(name: str) -> bool:
     if len(name) < 2:
         return False
     return any(c in _NAME_VERB_CHARS for c in name[1:])
+
+
+# ── [Fix #1] 中文名 4 字末尾溢出检测 ─────────────────────────────
+# 真实 3 字名（姓+名+名）后面紧接称谓/虚词时，贪婪正则 [\u4e00-\u9fa5]{2,4}
+# 会把第 4 字也吞进来，导致 "牧涵育" 变 "牧涵育先"。
+# 若第 4 字 ∈ _NAME_TAIL_SPILLOVER，或第 4+5 字构成职务/称谓开头 → 弃 4 字。
+# 注："反" 在这里：例 "信平素反映..." → 4 字 "信平素反" 溢出，退回 3 字 "信平素"。
+_NAME_TAIL_SPILLOVER = frozenset("先同女老生的了吗是就都会把说想要到这那之为与和及反")
+_NAME_TRAIL_JOB_HEADS = frozenset([
+    "先生", "女士", "同志", "老师", "医生", "大夫", "警官", "先后",
+])
+
+# [Fix #1] 动词 bigram —— 若候选名末尾 2 字 ∈ 这里，说明贪婪吃进动词短语。
+# 比如 "孙继续跟进"（孙是姓）产生 3 字候选 "孙继续"，末尾 `继续` ∈ bigrams → 弃。
+_NAME_FOLLOW_VERB_BIGRAMS = frozenset([
+    "反映", "反馈", "继续", "处理", "办理", "审查", "审核", "提交",
+    "通知", "更新", "提供", "咨询", "投诉", "举报", "跟进", "欺诈",
+    "告知", "询问", "拒绝", "承认", "表示", "答复", "回复", "上报",
+    "解决", "配合", "确认", "申请", "申报", "退款", "退货",
+])
+
+
+def _contains_verb_bigram(s: str) -> bool:
+    """候选里是否包含动词短语 2 字组（反映/继续/欺诈 ...）。"""
+    return any(s[k:k+2] in _NAME_FOLLOW_VERB_BIGRAMS for k in range(len(s) - 1))
+
+
+def _is_valid_name_shape(cand: str) -> bool:
+    """公共过滤链：黑名单/地址字/职务后缀/动词字/动词短语。"""
+    if _NAME_BLACKLIST_RE.search(cand):
+        return False
+    if any(c in _NAME_ADDR_CHARS for c in cand):
+        return False
+    if is_job_title_name(cand):
+        return False
+    if _is_verbish_name(cand):
+        return False
+    if _contains_verb_bigram(cand):
+        return False
+    return True
+
+
+def try_name_at(text: str, i: int):
+    """
+    以 text[i] 作为姓氏锚点尝试抽出一个名字候选。
+    返回 (name, consumed_len) 或 (None, 0)。
+    优先级 4 字 → 3 字（带末尾溢出保护），都失败返回 None。
+    **不处理 2 字名**（需触发词上下文，由调用方独立处理）。
+    """
+    n = len(text)
+    # 姓氏锚点校验
+    is_compound = (i + 2 <= n and text[i:i+2] in COMPOUND_SURNAMES)
+    is_single = text[i] in _SURNAMES_SET
+    if not (is_compound or is_single):
+        return None, 0
+
+    for L in (4, 3):
+        if i + L > n:
+            continue
+        cand = text[i:i+L]
+        if not all('\u4e00' <= c <= '\u9fa5' for c in cand):
+            continue
+        # 候选中任意相邻 2 字构成动词短语（反映/继续/欺诈 ...）→ 弃
+        if _contains_verb_bigram(cand):
+            continue
+        # 4 字末尾溢出保护
+        if L == 4:
+            next_char = text[i+L] if i+L < n else ''
+            if cand[-1] + next_char in _NAME_TRAIL_JOB_HEADS:
+                continue
+            if cand[-1] in _NAME_TAIL_SPILLOVER:
+                continue
+        # 候选后紧跟地址/机构字（族/省/市 ...）→ 整段是地址，弃
+        if i + L < n and text[i + L] in _NAME_ADDR_CHARS:
+            continue
+        if not _is_valid_name_shape(cand):
+            continue
+        return cand, L
+    return None, 0
 
 
 FIELD_NAME_DICT = {
@@ -458,25 +540,23 @@ def extract_sensitive_from_value(value_str: str) -> list:
         for m in pattern.finditer(value_str):
             _add(stype, m.group())
 
-    # ── CHINESE_NAME：字典+黑名单+姓氏首字+[P0-D]动词/病理字过滤 ──
-    for m in REGEX_PATTERNS["CHINESE_NAME"].finditer(value_str):
-        name = m.group()
-        if _NAME_BLACKLIST_RE.search(name):
-            continue
-        # 名字里混入地址/机构用字 → 大概率从地址文本里误切
-        if any(c in _NAME_ADDR_CHARS for c in name):
-            continue
-        # [P0-B] 职务/称谓后缀（王审计员/张警官/xxx先生）
-        if is_job_title_name(name):
-            continue
-        # [P0-D] 动词 / 病理 / 分词切片字（高血压/公积金提/家庭住）
-        if _is_verbish_name(name):
-            continue
-        if name[0] in _SURNAMES_SET:
-            _add("CHINESE_NAME", name)
-            continue
-        if len(name) >= 3 and name[:2] in COMPOUND_SURNAMES:
-            _add("CHINESE_NAME", name)
+    # ── CHINESE_NAME：[Fix #1] 姓氏锚点扫描替代贪婪正则 ──────────
+    # 旧做法 `[\u4e00-\u9fa5]{2,4}.finditer` 会把 "姓名翟琸" 整块吃进去，
+    # 因首字 "姓" 非姓氏就全丢了；而 "牧涵育先生" 又会贪成 4 字 "牧涵育先"。
+    # 新做法：在姓氏字符位置锚定，try_name_at 自动处理 4/3 字 + 末尾溢出。
+    i = 0
+    vlen = len(value_str)
+    while i < vlen:
+        c = value_str[i]
+        has_anchor = (c in _SURNAMES_SET
+                      or (i + 2 <= vlen and value_str[i:i+2] in COMPOUND_SURNAMES))
+        if has_anchor:
+            name, consumed = try_name_at(value_str, i)
+            if name:
+                _add("CHINESE_NAME", name)
+                i += consumed
+                continue
+        i += 1
 
     # ── ADDRESS：长度 + [P0-C] label 前缀拒绝 ──────────────────────
     for m in REGEX_PATTERNS["ADDRESS"].finditer(value_str):

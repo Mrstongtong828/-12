@@ -63,7 +63,12 @@ MAX_SCAN_LEN = 50_000
 LEAF_TEXT_MAX_LEN = 5_000
 
 # ── 并发配置（性能 #13/#14）─────────────────────────────────────
-# DB 线程池大小：显著大于任务数，让 I/O 线程在 OCR 串行排队时继续扫描其他非 OCR 表
-DB_WORKERS = 8
+# DB 线程池大小。
+# [比赛机 i5-10400 / 16GB / CPU only / Windows 11]
+# 多线程 + PaddleOCR 2.7 会触发段错误（paddle 内部线程在 GIL 切换时访问已释
+# 放状态），即便 task_queue.py 的 Semaphore 已把 OCR 序列化。
+# DB_WORKERS=1 时 main.py 会走主线程串行扫描跳过 ThreadPoolExecutor——这是
+# 在"单图 OCR 约 1-2s、非 OCR 表毫秒级"前提下最稳的方案。
+DB_WORKERS = 1
 # CSV 写入缓冲区：每个 DB 线程攒够 N 条才统一 flush，降低锁竞争
 WRITER_BUFFER_SIZE = 100

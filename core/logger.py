@@ -9,15 +9,24 @@ import logging
 import threading
 from datetime import datetime
 
-try:
-    from rich.progress import (
-        Progress, SpinnerColumn, TextColumn,
-        BarColumn, MofNCompleteColumn, TimeElapsedColumn,
-    )
-    from rich.console import Console
-    from rich.logging import RichHandler
-    _RICH_AVAILABLE = True
-except ImportError:
+import os
+
+# [稳定性] rich.Progress 的后台刷新线程在 Windows + Python 3.11 下和 PaddleOCR
+# 并存会触发段错误。默认关，需要时用 USE_RICH_PROGRESS=1 开启。
+_USE_RICH = os.environ.get("USE_RICH_PROGRESS", "0") == "1"
+
+if _USE_RICH:
+    try:
+        from rich.progress import (
+            Progress, SpinnerColumn, TextColumn,
+            BarColumn, MofNCompleteColumn, TimeElapsedColumn,
+        )
+        from rich.console import Console
+        from rich.logging import RichHandler
+        _RICH_AVAILABLE = True
+    except ImportError:
+        _RICH_AVAILABLE = False
+else:
     _RICH_AVAILABLE = False
 
 _LOG_FILE = "scan_error.log"

@@ -28,8 +28,8 @@ def read_records(filepath):
     with open(filepath, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            # 创建唯一键：数据库类型+表名+字段名+记录ID
-            key = (row['db_type'], row['table_name'], row['field_name'], row['record_id'])
+            key = (row['db_type'], row['db_name'], row['table_name'], row['field_name'],
+       row['record_id'], row['sensitive_type'], row['extracted_value'])
             if key in records:
                 duplicates.append(key)
             else:

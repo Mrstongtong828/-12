@@ -34,6 +34,59 @@ _PWD_FIELD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# [Fix #4] 字段名暗示 data_form=encoded：即使 value 不是真编码（如
+# "BANK_CARD:xxx|PHONE_NUMBER:yyy" 这类明文 key:value），答案也归为 encoded。
+_ENCODED_FIELD_RE = re.compile(
+    r"\b(?:encoded[_\w]*|payload|base64|encode|cipher|ciphertext|encrypted)\b",
+    re.IGNORECASE,
+)
+
+# [Fix #2] JSON/XML 解析失败后重判自然语言用：不再要求首字符非 `[{<`。
+# 长文本 + 含中文 或含自然语言标点 → 视作非结构化。
+_HAS_CHINESE_DISPATCH = re.compile(r"[\u4e00-\u9fa5]")
+_HAS_NATURAL_DISPATCH = re.compile(r"[\s,。！？、；：\u201c\u201d\u2018\u2019（）【】]")
+
+
+def _looks_unstructured_after_parse_fail(s: str) -> bool:
+    if not s or len(s) <= 10:
+        return False
+    return bool(_HAS_CHINESE_DISPATCH.search(s)) or bool(_HAS_NATURAL_DISPATCH.search(s))
+
+
+# [Fix #3] 字段名强烈提示为"单实体结构化字段"时，跳过 is_unstructured_text
+# 判定直接走 structured。修 shipping_address.full_address 被 is_unstructured_text
+# 误判成 unstructured_text 导致 form-mismatch 双扣分的问题。
+_STRUCTURED_FIELD_RE = re.compile(
+    r"\b(?:"
+    r"full_address|home_address|residence|addr|address|dizhi|"
+    r"real_name|true_name|customer_name|user_name|full_name|person_name|"
+    r"client_name|owner_name|contact_name|applicant_name|xingming|xm|"
+    r"phone_number|mobile_number|contact_phone|phone_no|tel_no|shouji|"
+    r"phone|mobile|tel|cellphone|"
+    r"email_address|contact_email|user_email|email|e_mail|mail|"
+    r"id_card|id_no|identity_card|idcard|id_number|sfz|national_id|"
+    r"bank_card|card_no|bank_account|account_no|card_number|bankcard|yinhangka|"
+    r"passport|passport_no|huzhao|"
+    r"license_plate|car_plate|vehicle_plate|plate_no|chepai|plate"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# [Fix #3] 句末强自然语言标记：有这类才让结构化字段回落到非结构化。
+# 避免短干净的地址/姓名被误判。
+_SENTENCE_MARK_RE = re.compile(r"[。！？；]|\.\s|[,，]\s*\S+\s*[，,]")
+
+
+def _is_pure_structured_field(field_name: str, value_str: str) -> bool:
+    if not _STRUCTURED_FIELD_RE.search(field_name):
+        return False
+    # value 过长或含句末标点 → 可能混了自然语言，不走 structured 短路
+    if len(value_str) > 120:
+        return False
+    if _SENTENCE_MARK_RE.search(value_str):
+        return False
+    return True
+
 
 def _is_binary(value) -> bool:
     return isinstance(value, (bytes, bytearray, memoryview))
@@ -91,7 +144,12 @@ def dispatch(field_name: str, value, record_id, table_name: str,
                                field_name, db_type, db_name)
         if hits:
             return hits
-        # JSON 解析失败时，降级走结构化兜底（保持 data_form 正确由下游处理）
+        # 解析失败：若像自然语言日志（如 "[2026-01-18 ...] 客服记录..."）
+        # 走非结构化；否则才降级到结构化。避免 data_form 被错贴成 semi_structured
+        # 导致官方分桶双扣分。
+        if _looks_unstructured_after_parse_fail(value_str):
+            return scan_unstructured_field(field_name, value_str, record_id,
+                                            table_name, field_name, db_type, db_name)
         return scan_structured_field(field_name, value_str, record_id,
                                      table_name, field_name, db_type, db_name)
 
@@ -101,7 +159,10 @@ def dispatch(field_name: str, value, record_id, table_name: str,
                               field_name, db_type, db_name)
         if hits:
             return hits
-        # XML 解析失败时，降级走结构化兜底
+        # XML 解析失败时同理，先看是不是自然语言文本
+        if _looks_unstructured_after_parse_fail(value_str):
+            return scan_unstructured_field(field_name, value_str, record_id,
+                                            table_name, field_name, db_type, db_name)
         return scan_structured_field(field_name, value_str, record_id,
                                      table_name, field_name, db_type, db_name)
 
@@ -113,6 +174,21 @@ def dispatch(field_name: str, value, record_id, table_name: str,
         if hits:
             return hits
         # 解码成功但无敏感命中，继续走结构化兜底
+
+    # ── 5a. [Fix #4] 字段名=encoded/payload/base64 但 value 不是真编码：
+    # 走 structured 正则扫描后把 data_form 重标成 encoded，避免 form 标错。
+    if _ENCODED_FIELD_RE.search(field_name):
+        hits = scan_structured_field(field_name, value_str, record_id,
+                                      table_name, field_name, db_type, db_name)
+        for h in hits:
+            h["data_form"] = "encoded"
+        return hits
+
+    # ── 5b. [Fix #3] 字段名=单实体结构化字段（full_address/real_name 等）时
+    #       强制走 structured，不要让 is_unstructured_text 误判
+    if _is_pure_structured_field(field_name, value_str):
+        return scan_structured_field(field_name, value_str, record_id,
+                                      table_name, field_name, db_type, db_name)
 
     # ── 6. 长自然语言文本 → unstructured_text ───────────────────
     if is_unstructured_text(value_str):

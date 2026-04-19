@@ -1,4 +1,16 @@
 import os
+
+# [OCR 稳定性] 必须在任何 numpy/cv2/paddle import 之前 pin OMP/MKL 线程数，
+# 否则 PaddleOCR 在 Windows 上会抛 "could not create a primitive" 或段错误。
+# 详见 scanners/blob.py 的注释。
+os.environ.setdefault("FLAGS_use_mkldnn", "0")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("FLAGS_eager_delete_tensor_gb", "0")
+os.environ.setdefault("FLAGS_allocator_strategy", "auto_growth")
+# [比赛机 i5-10400/16GB] Paddle 占比封顶 ~4GB
+os.environ.setdefault("FLAGS_fraction_of_cpu_memory_to_use", "0.25")
+
 import sys
 import importlib.metadata
 import time
@@ -101,7 +113,7 @@ def _sampled_rows(conn, db_type: str, table_name: str, pk_col):
             print(f"[ERROR] 无 PK 抽样失败 {table_name}: {e}")
         return
 
-    # 有 PK：拿 MIN/MAX，按 ID 区间切三段，并避免重复行
+    # 有 PK：拿 MIN/MAX，按 ID 区间切三段
     try:
         quote = "`" if db_type == "mysql" else '"'
         tbl = f"{quote}{table_name}{quote}"
@@ -132,7 +144,6 @@ def _sampled_rows(conn, db_type: str, table_name: str, pk_col):
         ]
 
         seq = 0
-        collected_pks = set()  # [dedup-fix] 跟踪已收集的主键，避免重复
         for where_order in segments:
             sql = f"SELECT * FROM {tbl} WHERE {where_order} LIMIT {per_segment}"
             try:
@@ -144,10 +155,6 @@ def _sampled_rows(conn, db_type: str, table_name: str, pk_col):
                         seq += 1
                         r_dict = _fix_row_mojibake(dict(r))
                         pk_value = r_dict.get(pk_col, seq)
-                        # [dedup-fix] 有真实主键时检查重复
-                        if pk_col and pk_value in collected_pks:
-                            continue
-                        collected_pks.add(pk_value)
                         yield (pk_value, r_dict)
                 else:
                     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -157,10 +164,6 @@ def _sampled_rows(conn, db_type: str, table_name: str, pk_col):
                         seq += 1
                         r_dict = dict(r)
                         pk_value = r_dict.get(pk_col, seq)
-                        # [dedup-fix] 有真实主键时检查重复
-                        if pk_col and pk_value in collected_pks:
-                            continue
-                        collected_pks.add(pk_value)
                         yield (pk_value, r_dict)
             except Exception as e:
                 print(f"[ERROR] 分段抽样失败 {table_name}: {e}")
@@ -278,21 +281,27 @@ def main():
             for db_name in cfg["databases"]
         ]
 
-        # [bug 修复 + #14] 修掉原来 `as executor::` 的语法错误；
-        # 并发度从 min(4, len(tasks)) 放大到 DB_WORKERS（默认 8）
-        # —— 当 OCR 串行时，空闲线程可以继续扫其他非 OCR 表
+        # [稳定性] DB_WORKERS=1 时直接在主线程串行扫描，跳过 ThreadPoolExecutor。
+        # PaddleOCR 在非主线程 + rich 后台刷新线程并存时容易段错误。
         pool_size = min(DB_WORKERS, max(1, len(tasks)))
-        with ThreadPoolExecutor(max_workers=pool_size) as executor:
-            futures = {
-                executor.submit(_scan_database, db_type, db_name, writer, log): (db_type, db_name)
-                for db_type, db_name in tasks
-            }
-            for future in as_completed(futures):
-                db_type, db_name = futures[future]
+        if pool_size == 1:
+            for db_type, db_name in tasks:
                 try:
-                    future.result()
+                    _scan_database(db_type, db_name, writer, log)
                 except Exception as e:
                     log.error(f"{db_type}/{db_name}", f"未捕获异常: {e}")
+        else:
+            with ThreadPoolExecutor(max_workers=pool_size) as executor:
+                futures = {
+                    executor.submit(_scan_database, db_type, db_name, writer, log): (db_type, db_name)
+                    for db_type, db_name in tasks
+                }
+                for future in as_completed(futures):
+                    db_type, db_name = futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        log.error(f"{db_type}/{db_name}", f"未捕获异常: {e}")
 
         elapsed = time.time() - _start_time
         stats = ai_stats()

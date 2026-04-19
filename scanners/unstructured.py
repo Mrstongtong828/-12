@@ -24,6 +24,9 @@ from core.patterns import (
     is_name_fp_field,              # [P0-A]
     is_job_title_name,             # [P0-B]
     _is_verbish_name,              # [P0-D]
+    try_name_at,                   # [Fix #1]
+    _is_valid_name_shape,          # [Fix #1]
+    _NAME_FOLLOW_VERB_BIGRAMS,     # [Fix #1] 2 字名后溢出检测用
 )
 from core.config import SENSITIVE_LEVEL_MAP
 from core.task_queue import ai_inference_slot
@@ -74,7 +77,8 @@ def get_uie_engine():
 
 # 模块级预编译
 _NAME_TRIGGER = re.compile(
-    r"(?:叫|名叫|姓名|姓名为|名字|名为|联系人|负责人|经手人|申请人|代理人)"
+    r"(?:叫|名叫|姓名|姓名为|名字|名为|联系人|负责人|经手人|申请人|代理人|"
+    r"用户|客户|顾客|乘客|接待|办理|来电|反馈|咨询|投诉|患者|申报人)"
 )
 _ENCODED_HINT = re.compile(
     r"^[A-Za-z0-9+/=]{20,}$|%[0-9A-Fa-f]{2}|\\u[0-9a-fA-F]{4}"
@@ -128,50 +132,46 @@ def _make_finding(db_type, db_name, table_name, field_col_name,
 
 def _scan_chinese_names(text: str) -> list:
     """
-    识别规则：
-      - 3-4 字名：姓氏匹配即可
-      - 2 字名：必须有触发词上下文
-      - 复姓：前 2 字在 COMPOUND_SURNAMES 中视为 4 字名
-    新增过滤：
-      - [P0-B] 职务/称谓后缀 → 过滤
-      - [P0-D] 动词/病理/分词切片字 → 过滤
+    [Fix #1] 姓氏锚点扫描：
+      - 3-4 字名：姓氏锚定 + 4 字末尾溢出保护（"牧涵育先生" → 取 "牧涵育"）
+      - 2 字名：姓氏锚定 + 触发词上下文
+      - 复姓：前 2 字在 COMPOUND_SURNAMES → 允许 3-4 字
+    避免了旧 `{2,4}` 贪婪正则把 "姓名翟琸" 整块吃进去导致漏抓的问题。
     """
     results = []
-    for m in _CN_WORD.finditer(text):
-        name = m.group()
-        if _NAME_BLACKLIST_RE.search(name):
-            continue
-        # 混入地址/机构用字 → 不是人名
-        if any(c in _NAME_ADDR_CHARS for c in name):
-            continue
-        # [P0-B] 职务/称谓后缀（王审计员/张警官/xxx先生）
-        if is_job_title_name(name):
-            continue
-        # [P0-D] 动词 / 病理 / 分词切片字（高血压/公积金提/家庭住）
-        if _is_verbish_name(name):
+    emitted = set()
+    n = len(text)
+    i = 0
+    while i < n:
+        c = text[i]
+        has_anchor = (c in _SURNAMES_SET
+                      or (i + 2 <= n and text[i:i+2] in COMPOUND_SURNAMES))
+        if not has_anchor:
+            i += 1
             continue
 
-        is_surname_match = False
-        # 单字姓
-        if name[0] in _SURNAMES_SET:
-            is_surname_match = True
-        # 复姓
-        elif len(name) >= 3 and name[:2] in COMPOUND_SURNAMES:
-            is_surname_match = True
-
-        if not is_surname_match:
-            continue
-
-        if len(name) >= 3:
-            # 3-4 字名直接认定
-            results.append(("CHINESE_NAME", name))
-        else:
-            # 2 字名需要触发词上下文
-            ctx_start = max(0, m.start() - 10)
-            ctx = text[ctx_start:m.start()]
-            if _NAME_TRIGGER.search(ctx):
+        # 先试 4/3 字直接通过（无需触发词）
+        name, consumed = try_name_at(text, i)
+        if name:
+            if name not in emitted:
+                emitted.add(name)
                 results.append(("CHINESE_NAME", name))
+            i += consumed
+            continue
 
+        # 再试 2 字名（需前置触发词）
+        if i + 2 <= n:
+            cand = text[i:i+2]
+            if (all('\u4e00' <= ch <= '\u9fa5' for ch in cand)
+                    and _is_valid_name_shape(cand)):
+                ctx_start = max(0, i - 10)
+                if _NAME_TRIGGER.search(text[ctx_start:i]):
+                    if cand not in emitted:
+                        emitted.add(cand)
+                        results.append(("CHINESE_NAME", cand))
+                    i += 2
+                    continue
+        i += 1
     return results
 
 
