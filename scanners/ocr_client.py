@@ -1,10 +1,18 @@
 """
 OCR 子进程客户端。
-改动要点:
-  - PER_IMAGE_TIMEOUT_SEC 45→25
-  - MAX_CONSEC_FAIL 3→2, 熔断更早触发
-  - 修 BUG: 每次 re-spawn 后首次调用使用 SPAWN_TIMEOUT_SEC,而不是被
-    _first_call 这个"整个 client 生命周期里只用一次"的标记压回 25s
+
+目标运行环境:
+  Intel i5-10400 / 16GB RAM / Win11 / CPU only (官方推荐)
+
+参数选择:
+  - PER_IMAGE_TIMEOUT_SEC = 25s:单图稳态推理约 1-2s,25s 是熔断兜底,不会误触发
+  - SPAWN_TIMEOUT_SEC = 60s:首次加载 PaddleOCR v4 三个模型需要 20-40s
+  - MAX_CONSEC_FAIL = 5:允许偶发失败,不因单张坏图熔断整个 OCR 路径
+
+关键改动(v3):
+  - MAX_CONSEC_FAIL 从 2 → 5,避免因偶发失败误触发全局熔断
+  - 修 BUG: 每次 re-spawn 后首次调用使用 SPAWN_TIMEOUT_SEC,
+    而不是被 _first_call 这个"整个 client 生命周期里只用一次"的标记压回 25s
 """
 import os
 import sys
@@ -12,9 +20,9 @@ import threading
 import subprocess
 import atexit
 
-PER_IMAGE_TIMEOUT_SEC = 25      # 从 45 下调
-SPAWN_TIMEOUT_SEC = 60
-MAX_CONSEC_FAIL = 2             # 从 3 下调
+PER_IMAGE_TIMEOUT_SEC = 25      # 单图稳态推理超时
+SPAWN_TIMEOUT_SEC = 60          # 首次/重建引擎的加载超时(三模型 ~30s)
+MAX_CONSEC_FAIL = 5             # 连续失败熔断阈值(从 2 上调到 5,容忍偶发)
 WORKER_MODULE = "scanners.ocr_worker"
 
 
@@ -24,7 +32,7 @@ class _OCRClient:
         self._lock = threading.Lock()
         self._consec_fail = 0
         self._disabled = False
-        # [改] 不再用 _first_call,改为"本次 request 是否刚 spawn"标记
+        # 新 worker 第一次调用需要长超时(加载模型),此后回到稳态超时
         self._just_spawned = False
 
     def _spawn(self):
@@ -37,7 +45,7 @@ class _OCRClient:
             cwd=os.getcwd(),
             shell=False,
         )
-        self._just_spawned = True   # 新 worker 第一次调用需要长超时
+        self._just_spawned = True
 
     def _kill_locked(self):
         if self._proc is None:
@@ -66,7 +74,7 @@ class _OCRClient:
                 print(f"[OCR] 子进程启动失败: {e}", flush=True)
                 return None
 
-            # [改] 根据是否刚 spawn 动态选择超时
+            # 根据是否刚 spawn 动态选择超时
             timeout = SPAWN_TIMEOUT_SEC if self._just_spawned else PER_IMAGE_TIMEOUT_SEC
             self._just_spawned = False
 
