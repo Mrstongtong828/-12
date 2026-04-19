@@ -3,31 +3,23 @@ OCR 子进程入口。主进程通过 stdin/stdout 二进制流与之通信。
 
 协议(长度前缀):
   请求  :  4B 大端长度 + 原始图片字节
-  响应  :  4B 大端长度 + UTF-8 文本(长度 0 = 本张识别失败)
+  响应  :  4B 大端长度 + UTF-8 文本(长度 0 = 本张无文字)
   关闭  :  主进程关 stdin → 本进程 read 返回空 → 正常退出
-
-用法:
-  python -u -m scanners.ocr_worker      # -u 必须,禁用 stdout 缓冲
-
-为什么要子进程:
-  PaddleOCR 2.7 在 Windows + Python 3.11 + CPU 下会偶发段错误
-  (oneDNN primitive 创建失败 + OMP 线程竞争),Python try/except 接不住。
-  放到子进程里死了就死了,主进程 BrokenPipeError → 重建即可。
+  熔断  :  连续 CONSEC_FAIL_EXIT 次内部失败或累计 TOTAL_FAIL_EXIT 次,
+          子进程不回响应直接 sys.exit,让主进程读 EOF 视为失败并累加熔断计数。
 """
 import os
 import sys
 
 # ── 必须最早设置 ─────────────────────────────────────────────────
-# numpy/cv2/paddle 的 C 扩展在 import 期一次性读取这些环境变量,
-# 之后改无效。子进程启动时第一件事就是 pin 线程数。
 os.environ.setdefault("FLAGS_use_mkldnn", "0")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("FLAGS_eager_delete_tensor_gb", "0")
 os.environ.setdefault("FLAGS_allocator_strategy", "auto_growth")
-os.environ.setdefault("FLAGS_fraction_of_cpu_memory_to_use", "0.25")
+# [调优] 0.25 太紧,numpy 经常分配失败;放到 0.4 (约 6.4GB on 16GB 机)
+os.environ.setdefault("FLAGS_fraction_of_cpu_memory_to_use", "0.4")
 
-# 关掉 stdout 的行缓冲,避免二进制协议错位
 if hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(line_buffering=False)
@@ -38,11 +30,20 @@ if hasattr(sys.stdout, "reconfigure"):
 DET_MODEL_DIR = "./models/paddleocr/ch_PP-OCRv4_det_infer"
 REC_MODEL_DIR = "./models/paddleocr/ch_PP-OCRv4_rec_infer"
 CLS_MODEL_DIR = "./models/paddleocr/ch_ppocr_mobile_v2.0_cls_infer"
-MAX_OCR_SIDE = 800
+
+# [调优] 800→640,大幅减少 (H,W,C) 张量内存;32 以下的图大概率是 icon 跳过
+MAX_OCR_SIDE = 640
+MIN_OCR_SIDE = 32
+
+# [新增] worker 内部熔断阈值
+CONSEC_FAIL_EXIT = 5      # 连续 5 次 OCR 内部异常即主动退出
+TOTAL_FAIL_EXIT = 15      # 累计 15 次异常也退出
+
+# [调优] 30→8,更频繁重建 PaddleOCR 引擎,避免 oneDNN/arena 状态污染
+RESET_EVERY = 8
 
 
 def _read_exact(stream, n: int):
-    """从 stream 精确读 n 字节,EOF 返回 None。"""
     buf = bytearray()
     while len(buf) < n:
         chunk = stream.read(n - len(buf))
@@ -53,14 +54,10 @@ def _read_exact(stream, n: int):
 
 
 def _make_ocr():
-    """懒加载 OCR 引擎。失败抛异常,由外层统一处理。"""
     from paddleocr import PaddleOCR
     return PaddleOCR(
-        use_angle_cls=True,
-        lang="ch",
-        use_gpu=False,
-        enable_mkldnn=False,
-        cpu_threads=1,
+        use_angle_cls=True, lang="ch",
+        use_gpu=False, enable_mkldnn=False, cpu_threads=1,
         det_model_dir=DET_MODEL_DIR,
         rec_model_dir=REC_MODEL_DIR,
         cls_model_dir=CLS_MODEL_DIR,
@@ -69,7 +66,6 @@ def _make_ocr():
 
 
 def _decode_image(blob_bytes: bytes):
-    """bytes → ndarray(HWC, BGR)。cv2 优先,PIL 兜底。失败返 None。"""
     img = None
     try:
         import numpy as np
@@ -91,28 +87,34 @@ def _decode_image(blob_bytes: bytes):
         return None
 
     h, w = img.shape[:2]
+    # [新增] 太小的图直接跳过,多半是 icon/logo,OCR 上跑毫无收益反而浪费内存
+    if min(h, w) < MIN_OCR_SIDE:
+        return None
+
     long_side = max(h, w)
     if long_side > MAX_OCR_SIDE:
         try:
             import cv2
             scale = MAX_OCR_SIDE / long_side
-            img = cv2.resize(img, (int(w * scale), int(h * scale)),
-                             interpolation=cv2.INTER_AREA)
+            new_w = max(1, int(w * scale))
+            new_h = max(1, int(h * scale))
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
         except Exception:
             pass
     return img
 
 
 def _ocr_once(ocr_engine, img_bytes: bytes) -> str:
-    """单次 OCR,失败返空串(不抛)。"""
+    """
+    单次 OCR。
+      返回字符串 → 成功(空串表示无文字)
+      抛异常    → OCR 内部失败,由调用方捕获并累加失败计数
+    注意:和旧版不同,这里不再吞异常,让调用方能区分"无文字" vs "失败"。
+    """
     img = _decode_image(img_bytes)
     if img is None:
-        return ""
-    try:
-        result = ocr_engine.ocr(img, cls=True)
-    except Exception as e:
-        sys.stderr.write(f"[ocr_worker] ocr call failed: {e}\n")
-        return ""
+        return ""  # 解码失败/图太小,不算 OCR 失败
+    result = ocr_engine.ocr(img, cls=True)
     if not result or not result[0]:
         return ""
     lines = []
@@ -140,7 +142,8 @@ def main():
 
     ocr_engine = None
     call_count = 0
-    RESET_EVERY = 30   # 每 30 张重建一次引擎,释放 Paddle arena
+    consec_fail = 0
+    total_fail = 0
 
     while True:
         header = _read_exact(stdin, 4)
@@ -150,8 +153,7 @@ def main():
         if n == 0:
             _write_response(stdout, "")
             continue
-        if n > 100 * 1024 * 1024:   # 单张硬上限 100MB,防跑飞
-            # 丢弃这批字节后回空
+        if n > 100 * 1024 * 1024:
             _ = _read_exact(stdin, n)
             _write_response(stdout, "")
             continue
@@ -166,7 +168,6 @@ def main():
             call_count = 0
             gc.collect()
 
-        # 懒加载;加载失败直接退出,让主进程知道 worker 不可用
         if ocr_engine is None:
             try:
                 ocr_engine = _make_ocr()
@@ -174,7 +175,31 @@ def main():
                 sys.stderr.write(f"[ocr_worker] engine init failed: {e}\n")
                 sys.exit(2)
 
-        text = _ocr_once(ocr_engine, img_bytes)
+        # ── 实际推理:区分"无文字"和"内部失败" ───────────────────
+        text = ""
+        try:
+            text = _ocr_once(ocr_engine, img_bytes)
+            consec_fail = 0
+        except Exception as e:
+            sys.stderr.write(f"[ocr_worker] ocr call failed: {e}\n")
+            consec_fail += 1
+            total_fail += 1
+            # 失败后立刻销毁引擎,下一次重新加载
+            ocr_engine = None
+            call_count = 0
+            try:
+                gc.collect()
+            except Exception:
+                pass
+
+            # ── 熔断:不写响应,直接退出,让主进程读 EOF 触发协议级失败
+            if consec_fail >= CONSEC_FAIL_EXIT or total_fail >= TOTAL_FAIL_EXIT:
+                sys.stderr.write(
+                    f"[ocr_worker] too many failures "
+                    f"(consec={consec_fail}, total={total_fail}), exiting\n"
+                )
+                sys.exit(3)
+
         call_count += 1
         _write_response(stdout, text)
 
@@ -183,7 +208,6 @@ if __name__ == "__main__":
     try:
         main()
     except BrokenPipeError:
-        # 父进程先关了 stdin/stdout,正常退出
         pass
     except KeyboardInterrupt:
         pass
