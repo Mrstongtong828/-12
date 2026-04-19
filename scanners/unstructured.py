@@ -93,7 +93,10 @@ _HAS_NATURAL = re.compile(r"[\s,。！？、；：\u201c\u201d\u2018\u2019（）
 _CN_WORD = re.compile(r"[\u4e00-\u9fa5]{2,4}")
 
 _VALID_TLD = re.compile(r'\.[a-zA-Z]{2,6}$')
-_IP_PATH_PREFIX = re.compile(r'(?:/\d|:\d)')  # 匹配 /24 或 :8080 这类路径/端口
+ #只过滤 CIDR(/后跟 1-2 位数字,如 /24),不过滤 :端口
+_IP_CIDR_SUFFIX = re.compile(r'^/\d{1,2}(?!\d)')
+# 还要过滤版本号模式: IP 紧跟 . 或 - 表示它不是真 IP(如 "v1.2.3.4.5" 截出的 1.2.3.4)
+_IP_VERSION_SUFFIX = re.compile(r'^[.\-]\d')
 
 # 地址正则预编译
 _ADDRESS_RE = re.compile(
@@ -268,11 +271,16 @@ def _post_filter(findings: list, text: str, field_name: str = None) -> list:
                 continue
 
         if stype == "IP_ADDRESS":
-            idx = text.find(val)
-            if idx >= 0:
-                after = text[idx + len(val):idx + len(val) + 4]
-                if _IP_PATH_PREFIX.match(after):
-                    continue
+             idx = text.find(val)
+             if idx >= 0:
+                 after = text[idx + len(val):idx + len(val) + 4]
+                 # 过滤 CIDR(/24 等)
+                 if _IP_CIDR_SUFFIX.match(after):
+                     continue
+                 # 过滤版本号(1.2.3.4.5 截出的假 IP)
+                 if _IP_VERSION_SUFFIX.match(after):
+                     continue
+                 # 不再过滤 :端口 —— "192.168.1.1:8080" 里的 IP 是合法答案
         elif stype == "EMAIL":
             if not _VALID_TLD.search(val):
                 continue
