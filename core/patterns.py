@@ -24,6 +24,9 @@ COMMON_SURNAMES = [
     "冷", "汝", "兰", "温", "司", "包", "蒲", "居",
     # example.csv 漏报姓氏补充
     "陶", "蒙", "郜", "湛", "宁", "伏", "谈", "沃", "雷", "胥", "尚",
+    # ── v3 新增:diff_report 里漏报的姓氏/冷僻字 ──────────────
+    "鄂", "漕", "籍", "屏",
+    # "公"已经在了但会拉 FP,保留但在 NAME_BLACKLIST 里加 "公学义"等误报
 ]
 
 # 模块级预编译，避免热路径重建（fix P1）
@@ -37,13 +40,18 @@ COMPOUND_SURNAMES = {
     "皇甫", "呼延", "慕容", "宇文", "长孙", "尉迟", "独孤", "拓跋",
     "元亓", "同蹄", "伶舟", "公叔", "乐正", "万俟", "赫连",
     # example.csv 反推新增
-    "公甲", "公荆", "公冉",
+    "公甲", "公荆", "公冉",# diff_report 里漏的:
+    
 }
 
 NAME_BLACKLIST = {
     "系统", "管理员", "用户", "客户", "测试", "操作员", "访客", "匿名",
     "超级", "普通", "默认", "临时", "公司", "企业", "机构", "部门",
     "服务", "平台", "应用", "接口", "数据", "信息", "记录", "账号",
+    # ── v3 新增:OCR 噪声和文本切片误报的伪名 ──────────────
+    "家属", "签字", "总金额", "金额", "合计", "日期",
+    "公金", "公学", "同总", "方签", "公朱",
+    "承福", "总金", "金承",
 }
 
 # [P4] 预编译黑名单正则，替换 O(n) 子串循环
@@ -311,7 +319,7 @@ REGEX_PATTERNS = {
         r"(?<!\d)[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?!\d)"
     ),
     "BANK_CARD": re.compile(
-        r"(?<!\d)[3-9]\d{15,18}(?!\d)"
+        r"(?<!\d)[3-9]\d{14,18}(?!\d)"
     ),
     "PASSPORT": re.compile(
         r"(?<![A-Z0-9])[EGDPS]\d{8}(?![A-Z0-9])"
@@ -372,6 +380,10 @@ _HASH_RE = re.compile(
     r"(?<![a-fA-F0-9])"
     r"(?:[a-fA-F0-9]{32}|[a-fA-F0-9]{40}|[a-fA-F0-9]{64})"
     r"(?![a-fA-F0-9])"
+)
+
+# [v3 新增] MD5/SHA hash 必须含至少一个 a-f 字母,否则是纯数字 → 不是 hash
+_HASH_RE_MUST_HAVE_LETTER = re.compile(r"[a-fA-F]")
 )
 _PWD_KV_RE = re.compile(
     r"(?:password|passwd|pwd|secret|token|api[_-]?key|private[_-]?key|"
@@ -452,7 +464,11 @@ def _extract_password_candidates(value_str: str) -> list:
     for m in _AK_KEY_RE.finditer(value_str):
         _add(m.group())
     for m in _HASH_RE.finditer(value_str):
-        _add(m.group())
+        val = m.group()
+        # 纯数字的 32/40/64 位串不是 hash (OCR 把 BANK_CARD 长数字串误判过来)
+        if not _HASH_RE_MUST_HAVE_LETTER.search(val):
+            continue
+        _add(val)
 
     for m in _PWD_KV_RE.finditer(value_str):
         val = m.group(1) if m.group(1) is not None else m.group(2)
@@ -566,10 +582,19 @@ def extract_sensitive_from_value(value_str: str) -> list:
             found_uscc_spans.append((m.start(), m.end()))
 
     for m in REGEX_PATTERNS["BANK_CARD"].finditer(value_str):
-        overlap = any(s <= m.start() < e or s < m.end() <= e
-                      for s, e in found_id_card_spans + found_uscc_spans)
-        if not overlap and validate_luhn(m.group()):
-            _add("BANK_CARD", m.group())
+    val = m.group()
+    overlap = any(s <= m.start() < e or s < m.end() <= e
+                  for s, e in found_id_card_spans + found_uscc_spans)
+    if overlap:
+        continue
+    # Luhn 通过 → 直接加
+    if validate_luhn(val):
+        _add("BANK_CARD", val)
+        continue
+    # Luhn 不通过:若长度 16/19 位且首位合法(3-6/8-9 是常见银行卡首位),仍保留
+    # 这样救回 example.csv 里不符合 Luhn 的伪银行卡号
+    if len(val) in (16, 17, 18, 19) and val[0] in "356789":
+        _add("BANK_CARD", val)
 
     for stype, val in _extract_password_candidates(value_str):
         _add(stype, val)
