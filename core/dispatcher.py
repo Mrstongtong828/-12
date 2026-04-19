@@ -24,7 +24,11 @@ from scanners.encoded import (
 )
 from scanners.unstructured import scan_unstructured_field, is_unstructured_text
 from scanners.blob import scan_blob_field
+
+# [README 对齐] 官方规则明确:噪声行的字段值为 "N/A_数字" 形式，直接跳过。
+# 在入口处快速过滤，省掉整条 dispatch 链(尤其能避免走 unstructured/blob 浪费预算)。
 _NOISE_VALUE_RE = re.compile(r"^N/A_\d+$")
+
 _HEX_CHARS_DISPATCH = re.compile(r'^[0-9a-fA-F]+$')
 
 _PWD_FIELD_RE = re.compile(
@@ -107,7 +111,7 @@ def dispatch(field_name: str, value, record_id, table_name: str,
     统一分发入口。根据值特征路由到对应扫描器，返回 findings 列表。
     每个 finding 是含完整 9 列字段的字典。
     """
-    # ── 1. 二进制数据 → OCR ──────────────────────────────────────
+    # ── 1. 二进制数据 → OCR/文档解析 ────────────────────────────
     if _is_binary(value):
         return scan_blob_field(value, record_id, table_name, field_name, db_type, db_name)
 
@@ -116,6 +120,13 @@ def dispatch(field_name: str, value, record_id, table_name: str,
 
     value_str = str(value).strip()
     if not value_str:
+        return []
+
+    # ── 0. 噪声行快速跳过 ────────────────────────────────────────
+    # README 明确: 噪声行的字段值为 "N/A_数字" 形式，不需要出现在 upload.csv。
+    # 在此处过滤掉，避免下游扫描器浪费 CPU 预算(尤其避免长 "N/A_xxx"
+    # 字串走进 unstructured 路径)。
+    if _NOISE_VALUE_RE.match(value_str):
         return []
 
     # ── 1b. \x 前缀十六进制字符串 → 视为 BLOB ────────────────────────
