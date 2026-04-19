@@ -1,34 +1,34 @@
 """
 OCR 子进程入口。主进程通过 stdin/stdout 二进制流与之通信。
 
+目标运行环境:
+  Intel i5-10400 / 16GB RAM / Win11 / CPU only (官方推荐)
+  16GB 对 PaddleOCR v4 中文模型充足,不必过度压缩参数。
+
 协议(长度前缀):
   请求  :  4B 大端长度 + 原始图片字节
   响应  :  4B 大端长度 + UTF-8 文本(长度 0 = 本张无文字)
   关闭  :  主进程关 stdin → 本进程 read 返回空 → 正常退出
   熔断  :  连续 CONSEC_FAIL_EXIT 次内部失败或累计 TOTAL_FAIL_EXIT 次,
-          子进程不回响应直接 sys.exit,让主进程读 EOF 视为失败并累加熔断计数。
+          子进程不回响应直接 sys.exit,让主进程读 EOF 视为失败。
 
-v2 稳定性改动(基于 diff_report 发现 OCR 大量内存分配失败):
-  - MAX_OCR_SIDE: 640 → 512 (再砍 40% 像素)
-  - RESET_EVERY: 8 → 4 (更频繁重建引擎,避免内存池碎片化)
-  - 大图增加第二道缩放闸: 长边 > 1024 时先粗缩到 768 再精缩
-  - 每次推理前强制 gc,降低峰值占用
-  - 失败后立即 release 引擎并 gc,不等下一轮
-  - FLAGS_fraction_of_cpu_memory_to_use 0.4 → 0.3 (更保守)
+参数选择说明(针对 16GB 官方机型):
+  - FLAGS_fraction_of_cpu_memory_to_use = 0.5 (约 8GB 给 Paddle)
+  - MAX_OCR_SIDE = 800 (保识别质量,不牺牲 Recall)
+  - RESET_EVERY = 16 (重建周期,平衡内存与加载开销)
+  - PER_IMAGE_TIMEOUT = 由 ocr_client 端控制,这里只管稳态推理
 """
 import os
 import sys
 
-# ── 必须最早设置 ─────────────────────────────────────────────────
+# ── 必须最早设置(import paddle 之前) ────────────────────────────
 os.environ.setdefault("FLAGS_use_mkldnn", "0")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("FLAGS_eager_delete_tensor_gb", "0")
 os.environ.setdefault("FLAGS_allocator_strategy", "auto_growth")
-# [v2] 0.4 → 0.3, 给 numpy / cv2 留更多余量, 减少 memory_object 创建失败
-os.environ.setdefault("FLAGS_fraction_of_cpu_memory_to_use", "0.3")
-# [v2] 禁用 Paddle 的 memory reuse 优化,防止内存池碎片累积
-os.environ.setdefault("FLAGS_memory_fraction_of_eager_deletion", "1.0")
+# [16GB 官方机型] 0.5 = 约 8GB 上限,足够 PaddleOCR v4 中文大模型运行
+os.environ.setdefault("FLAGS_fraction_of_cpu_memory_to_use", "0.5")
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -41,20 +41,20 @@ DET_MODEL_DIR = "./models/paddleocr/ch_PP-OCRv4_det_infer"
 REC_MODEL_DIR = "./models/paddleocr/ch_PP-OCRv4_rec_infer"
 CLS_MODEL_DIR = "./models/paddleocr/ch_ppocr_mobile_v2.0_cls_infer"
 
-# [v2] 640 → 512, 再砍 40% 像素内存占用
-MAX_OCR_SIDE = 512
+# 图片尺寸约束
+# 800 是 PaddleOCR 默认 det_db 输入边长,对中文识别质量友好;16GB 内存绰绰有余
+MAX_OCR_SIDE = 800
 MIN_OCR_SIDE = 32
-# [v2] 大图预缩放阈值: 长边 > 此值先粗缩到 768 再精缩到 MAX_OCR_SIDE
-# 一步到位 cv2.resize 对 3000px 原图会瞬间分配 ~27MB,分两步降峰值
-PRE_SCALE_THRESHOLD = 1024
-PRE_SCALE_TARGET = 768
+# 超大图(高清证件照等)先粗缩降峰值
+PRE_SCALE_THRESHOLD = 2000
+PRE_SCALE_TARGET = 1200
 
 # worker 内部熔断阈值
 CONSEC_FAIL_EXIT = 5
 TOTAL_FAIL_EXIT = 15
 
-# [v2] 8 → 4, 更频繁重建引擎, 对抗内存池碎片
-RESET_EVERY = 4
+# 引擎重建周期(平衡内存碎片 vs 加载开销)
+RESET_EVERY = 16
 
 
 def _read_exact(stream, n: int):
@@ -80,6 +80,7 @@ def _make_ocr():
 
 
 def _decode_image(blob_bytes: bytes):
+    """解码图片字节 → numpy BGR 矩阵,同时做尺寸限制。"""
     import numpy as np
     try:
         import cv2
@@ -107,12 +108,14 @@ def _decode_image(blob_bytes: bytes):
         return None
 
     h, w = img.shape[:2]
+    # 太小的图直接跳过,多半是 icon/logo
     if min(h, w) < MIN_OCR_SIDE:
         return None
 
     long_side = max(h, w)
 
-    # [v2] 两步缩放: 超大图先粗缩再精缩,降分配峰值
+    # 两步缩放:超大图(>2000px)先粗缩到 1200px,再精缩到 800px
+    # 分两步减少单次 cv2.resize 的峰值内存占用
     if long_side > PRE_SCALE_THRESHOLD and cv2 is not None:
         try:
             scale1 = PRE_SCALE_TARGET / long_side
@@ -124,7 +127,6 @@ def _decode_image(blob_bytes: bytes):
         except Exception:
             pass
 
-    # 精缩到 MAX_OCR_SIDE
     if long_side > MAX_OCR_SIDE and cv2 is not None:
         try:
             scale = MAX_OCR_SIDE / long_side
@@ -206,11 +208,6 @@ def main():
                 sys.stderr.write(f"[ocr_worker] engine init failed: {e}\n")
                 sys.exit(2)
 
-        # [v2] 每次推理前主动 gc,降低峰值占用
-        if call_count > 0 and call_count % 2 == 0:
-            gc.collect()
-
-        # ── 实际推理 ─────────────────────────────────────────────
         text = ""
         try:
             text = _ocr_once(ocr_engine, img_bytes)
