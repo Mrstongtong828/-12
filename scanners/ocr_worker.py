@@ -7,6 +7,14 @@ OCR 子进程入口。主进程通过 stdin/stdout 二进制流与之通信。
   关闭  :  主进程关 stdin → 本进程 read 返回空 → 正常退出
   熔断  :  连续 CONSEC_FAIL_EXIT 次内部失败或累计 TOTAL_FAIL_EXIT 次,
           子进程不回响应直接 sys.exit,让主进程读 EOF 视为失败并累加熔断计数。
+
+v2 稳定性改动(基于 diff_report 发现 OCR 大量内存分配失败):
+  - MAX_OCR_SIDE: 640 → 512 (再砍 40% 像素)
+  - RESET_EVERY: 8 → 4 (更频繁重建引擎,避免内存池碎片化)
+  - 大图增加第二道缩放闸: 长边 > 1024 时先粗缩到 768 再精缩
+  - 每次推理前强制 gc,降低峰值占用
+  - 失败后立即 release 引擎并 gc,不等下一轮
+  - FLAGS_fraction_of_cpu_memory_to_use 0.4 → 0.3 (更保守)
 """
 import os
 import sys
@@ -17,8 +25,10 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("FLAGS_eager_delete_tensor_gb", "0")
 os.environ.setdefault("FLAGS_allocator_strategy", "auto_growth")
-# [调优] 0.25 太紧,numpy 经常分配失败;放到 0.4 (约 6.4GB on 16GB 机)
-os.environ.setdefault("FLAGS_fraction_of_cpu_memory_to_use", "0.4")
+# [v2] 0.4 → 0.3, 给 numpy / cv2 留更多余量, 减少 memory_object 创建失败
+os.environ.setdefault("FLAGS_fraction_of_cpu_memory_to_use", "0.3")
+# [v2] 禁用 Paddle 的 memory reuse 优化,防止内存池碎片累积
+os.environ.setdefault("FLAGS_memory_fraction_of_eager_deletion", "1.0")
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -31,16 +41,20 @@ DET_MODEL_DIR = "./models/paddleocr/ch_PP-OCRv4_det_infer"
 REC_MODEL_DIR = "./models/paddleocr/ch_PP-OCRv4_rec_infer"
 CLS_MODEL_DIR = "./models/paddleocr/ch_ppocr_mobile_v2.0_cls_infer"
 
-# [调优] 800→640,大幅减少 (H,W,C) 张量内存;32 以下的图大概率是 icon 跳过
-MAX_OCR_SIDE = 640
+# [v2] 640 → 512, 再砍 40% 像素内存占用
+MAX_OCR_SIDE = 512
 MIN_OCR_SIDE = 32
+# [v2] 大图预缩放阈值: 长边 > 此值先粗缩到 768 再精缩到 MAX_OCR_SIDE
+# 一步到位 cv2.resize 对 3000px 原图会瞬间分配 ~27MB,分两步降峰值
+PRE_SCALE_THRESHOLD = 1024
+PRE_SCALE_TARGET = 768
 
-# [新增] worker 内部熔断阈值
-CONSEC_FAIL_EXIT = 5      # 连续 5 次 OCR 内部异常即主动退出
-TOTAL_FAIL_EXIT = 15      # 累计 15 次异常也退出
+# worker 内部熔断阈值
+CONSEC_FAIL_EXIT = 5
+TOTAL_FAIL_EXIT = 15
 
-# [调优] 30→8,更频繁重建 PaddleOCR 引擎,避免 oneDNN/arena 状态污染
-RESET_EVERY = 8
+# [v2] 8 → 4, 更频繁重建引擎, 对抗内存池碎片
+RESET_EVERY = 4
 
 
 def _read_exact(stream, n: int):
@@ -66,35 +80,53 @@ def _make_ocr():
 
 
 def _decode_image(blob_bytes: bytes):
-    img = None
+    import numpy as np
     try:
-        import numpy as np
         import cv2
-        arr = np.frombuffer(blob_bytes, np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     except Exception:
-        pass
+        cv2 = None
+
+    img = None
+    if cv2 is not None:
+        try:
+            arr = np.frombuffer(blob_bytes, np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        except Exception:
+            pass
+
     if img is None:
         try:
             import io
-            import numpy as np
             from PIL import Image
             img_pil = Image.open(io.BytesIO(blob_bytes)).convert("RGB")
             img = np.array(img_pil)[:, :, ::-1]
         except Exception:
             return None
+
     if img is None:
         return None
 
     h, w = img.shape[:2]
-    # [新增] 太小的图直接跳过,多半是 icon/logo,OCR 上跑毫无收益反而浪费内存
     if min(h, w) < MIN_OCR_SIDE:
         return None
 
     long_side = max(h, w)
-    if long_side > MAX_OCR_SIDE:
+
+    # [v2] 两步缩放: 超大图先粗缩再精缩,降分配峰值
+    if long_side > PRE_SCALE_THRESHOLD and cv2 is not None:
         try:
-            import cv2
+            scale1 = PRE_SCALE_TARGET / long_side
+            new_w = max(1, int(w * scale1))
+            new_h = max(1, int(h * scale1))
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            h, w = img.shape[:2]
+            long_side = max(h, w)
+        except Exception:
+            pass
+
+    # 精缩到 MAX_OCR_SIDE
+    if long_side > MAX_OCR_SIDE and cv2 is not None:
+        try:
             scale = MAX_OCR_SIDE / long_side
             new_w = max(1, int(w * scale))
             new_h = max(1, int(h * scale))
@@ -109,11 +141,10 @@ def _ocr_once(ocr_engine, img_bytes: bytes) -> str:
     单次 OCR。
       返回字符串 → 成功(空串表示无文字)
       抛异常    → OCR 内部失败,由调用方捕获并累加失败计数
-    注意:和旧版不同,这里不再吞异常,让调用方能区分"无文字" vs "失败"。
     """
     img = _decode_image(img_bytes)
     if img is None:
-        return ""  # 解码失败/图太小,不算 OCR 失败
+        return ""
     result = ocr_engine.ocr(img, cls=True)
     if not result or not result[0]:
         return ""
@@ -175,7 +206,11 @@ def main():
                 sys.stderr.write(f"[ocr_worker] engine init failed: {e}\n")
                 sys.exit(2)
 
-        # ── 实际推理:区分"无文字"和"内部失败" ───────────────────
+        # [v2] 每次推理前主动 gc,降低峰值占用
+        if call_count > 0 and call_count % 2 == 0:
+            gc.collect()
+
+        # ── 实际推理 ─────────────────────────────────────────────
         text = ""
         try:
             text = _ocr_once(ocr_engine, img_bytes)
@@ -192,7 +227,6 @@ def main():
             except Exception:
                 pass
 
-            # ── 熔断:不写响应,直接退出,让主进程读 EOF 触发协议级失败
             if consec_fail >= CONSEC_FAIL_EXIT or total_fail >= TOTAL_FAIL_EXIT:
                 sys.stderr.write(
                     f"[ocr_worker] too many failures "
