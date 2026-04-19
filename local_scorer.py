@@ -32,6 +32,25 @@ import unicodedata
 from collections import defaultdict
 from pathlib import Path
 
+try:
+    for _s in (sys.stdout, sys.stderr):
+        if hasattr(_s, "reconfigure"):
+            _s.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich import box
+    _RICH = True
+    _console = Console(legacy_windows=False, force_terminal=True)
+except ImportError:
+    _RICH = False
+    _console = None
+
 # ── 配置 ─────────────────────────────────────────────────────────
 DEFAULT_ANSWER = Path("tests/example.csv")
 DEFAULT_PRED   = Path("output/upload.csv")
@@ -213,13 +232,192 @@ def _bar(f1: float, width: int = 20) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def print_report(result: dict):
+def _f1_color(f1: float) -> str:
+    if f1 >= 0.8:
+        return "green"
+    if f1 >= 0.5:
+        return "yellow"
+    return "red"
+
+
+def _f1_bar_rich(f1: float, width: int = 20) -> Text:
+    filled = int(f1 * width)
+    color = _f1_color(f1)
+    t = Text()
+    t.append("█" * filled, style=color)
+    t.append("░" * (width - filled), style="dim")
+    return t
+
+
+def _print_report_rich(result: dict):
+    scope_label = "3元组 (v1 兼容)" if result["strict_scope"] else "4元组 (推荐)"
+    _console.print(Panel.fit(
+        Text.assemble(
+            ("本地评分报告 v3", "bold cyan"),
+            ("   对齐 README §6 官方公式\n", "dim"),
+            ("Scope 模式: ", ""),
+            (scope_label, "bold"),
+        ),
+        border_style="cyan",
+    ))
+
+    # ── [A] 分桶 F1 ─────────────────────────────────────────────
+    table_a = Table(
+        title="[A] 分桶 F1  —  README §6.1 ①",
+        box=box.SIMPLE_HEAVY, header_style="bold",
+        title_justify="left",
+    )
+    table_a.add_column("形态", style="cyan", no_wrap=True)
+    table_a.add_column("F1", justify="right")
+    table_a.add_column("TP", justify="right", style="green")
+    table_a.add_column("FP", justify="right", style="red")
+    table_a.add_column("FN", justify="right", style="yellow")
+    table_a.add_column("权重", justify="right", style="dim")
+    table_a.add_column("进度", no_wrap=True)
+
+    for form, weight in FORM_WEIGHTS.items():
+        d = result["form_detail"].get(form, {"f1": 0, "tp": 0, "fp": 0, "fn": 0})
+        f1_text = Text(f"{d['f1']:.3f}", style=_f1_color(d["f1"]))
+        table_a.add_row(
+            form, f1_text,
+            str(d["tp"]), str(d["fp"]), str(d["fn"]),
+            f"{weight:.0%}", _f1_bar_rich(d["f1"]),
+        )
+    _console.print(table_a)
+
+    extra = [f for f in result["form_detail"] if f not in FORM_WEIGHTS]
+    if extra:
+        _console.print("[bold red][!] 未知 data_form（不计入加权分，检查拼写）：[/]")
+        for form in extra:
+            d = result["form_detail"][form]
+            _console.print(
+                f"   [red]{form:<18}[/] F1={d['f1']:.3f} "
+                f"TP={d['tp']} FP={d['fp']} FN={d['fn']}"
+            )
+
+    # ── [B] 加权 F1 + 天花板 ─────────────────────────────────────
+    wf1 = result["weighted_f1"]
+    b_text = Text.assemble(
+        ("加权 F1 = Σ(权重 × F1_form)  →  ", ""),
+        (f"{wf1:.4f}", f"bold {_f1_color(wf1)}"),
+    )
+    ceil_f1 = result["local_ceiling_f1"]
+    ceil_comp = ceil_f1 * 0.70 + 1.0 * 0.30
+    if ceil_f1 < 0.999:
+        achieve = wf1 / ceil_f1 * 100 if ceil_f1 > 0 else 0.0
+        b_text.append(
+            f"\n[天花板] 本地完美预测最多 {ceil_f1:.4f}（达成率 {achieve:.1f}%）\n",
+            style="dim yellow",
+        )
+        b_text.append(
+            f"         抽样未覆盖的 form: {result['uncovered_forms']}\n",
+            style="dim",
+        )
+        b_text.append(
+            f"         对应综合识别得分本地天花板: {ceil_comp:.4f}",
+            style="dim yellow",
+        )
+    _console.print(Panel(b_text, title="[B] 加权 F1", border_style="cyan",
+                         title_align="left"))
+
+    # ── [C] 等级准确率 ───────────────────────────────────────────
+    level_acc = result["level_acc_official"]
+    c_text = Text.assemble(
+        ("公式: 等级正确的TP数 / 答案总行数\n", "dim"),
+        (f"= {result['correct_level']} / {result['total_answer']}  = ", ""),
+        (f"{level_acc:.4f}", f"bold {_f1_color(level_acc)}"),
+        (f"\n诊断: TP-only 等级准确率 = "
+         f"{result['correct_level']}/{result['total_tp']} "
+         f"= {result['level_acc_tp_only']:.4f}", "dim"),
+    )
+    _console.print(Panel(c_text, title="[C] 等级准确率  —  README §6.1 ③",
+                         border_style="cyan", title_align="left"))
+
+    # ── [D] 综合识别得分 ────────────────────────────────────────
+    comp = result["comprehensive"]
+    d_text = Text.assemble(
+        ("综合识别得分 = 加权F1 × 0.70 + 等级准确率 × 0.30\n", ""),
+        (f"= {wf1:.4f}×0.70 + {level_acc:.4f}×0.30\n", "dim"),
+        ("= ", ""),
+        (f"{comp:.4f}", f"bold {_f1_color(comp)}"),
+        ("   ← 对应靶机返回值", "dim"),
+    )
+    _console.print(Panel(d_text, title="[D] 综合识别得分 (靶机)",
+                         border_style="bright_cyan", title_align="left"))
+
+    # ── [E] Value-only F1 ───────────────────────────────────────
+    table_e = Table(
+        title="[E] Value-only F1  (忽略 data_form，诊断用)",
+        box=box.SIMPLE, title_justify="left",
+    )
+    table_e.add_column("指标", style="cyan")
+    table_e.add_column("值", justify="right")
+    vf1 = result["value_f1"]
+    table_e.add_row("precision", f"{result['value_precision']:.4f}")
+    table_e.add_row("recall",    f"{result['value_recall']:.4f}")
+    table_e.add_row("f1",        Text(f"{vf1:.4f}", style=_f1_color(vf1)))
+    table_e.add_row("TP", Text(str(result["value_tp"]), style="green"))
+    table_e.add_row("FP", Text(str(result["value_fp"]), style="red"))
+    table_e.add_row("FN", Text(str(result["value_fn"]), style="yellow"))
+    _console.print(table_e)
+
+    mm = result["form_mismatch"]
+    if mm > 0:
+        _console.print(Panel(
+            Text.assemble(
+                (f"值找对但 data_form 标错: {mm} 条\n", "bold yellow"),
+                ("官方分桶会把这些条目计为 FP+FN（双重扣分）。"
+                 "修 dispatcher 路由逻辑能一次吃下两倍收益。", "dim"),
+            ),
+            border_style="yellow", title="[!] Form 标错提示",
+            title_align="left",
+        ))
+
+    # ── [F] 数据概况 ────────────────────────────────────────────
+    table_f = Table(title="[F] 数据概况", box=box.SIMPLE, title_justify="left")
+    table_f.add_column("项", style="cyan")
+    table_f.add_column("值", justify="right")
+    table_f.add_row("答案去重后总行数", str(result["total_answer"]))
+    table_f.add_row("预测原始总行数", str(result["total_pred_raw"]))
+    table_f.add_row("预测落入 scope 的行数", str(result["total_pred_in_scope"]))
+    note = " (v1 会把这些算成 FP)" if not result["strict_scope"] else ""
+    table_f.add_row(
+        "预测被 scope 过滤的行数",
+        Text(f"{result['dropped_out_scope']}{note}", style="dim"),
+    )
+    _console.print(table_f)
+
+    # ── 提示 ────────────────────────────────────────────────────
+    _console.print(Panel(
+        "[dim]example.csv 是 ~1% 抽样答案（README §五），本地分数只反映抽到\n"
+        "的那部分。靶机用完整答案集，实际分数会有差异；value_fp 中若看到\n"
+        "大量合理敏感值，说明抽样遗漏的 TP 比较多，不要为了消灭它们而收紧\n"
+        "正则，会反过来压低靶机 recall。[/]",
+        border_style="dim", title="[i] 抽样说明", title_align="left",
+    ))
+
+    needs = {f: d for f, d in result["form_detail"].items()
+             if d["fp"] > 0 or d["fn"] > 0}
+    if needs:
+        t_need = Table(
+            title="[!] 需要关注的形态（有误报或漏报）",
+            box=box.SIMPLE, title_justify="left", title_style="bold yellow",
+        )
+        t_need.add_column("形态", style="cyan")
+        t_need.add_column("FP", justify="right", style="red")
+        t_need.add_column("FN", justify="right", style="yellow")
+        for form, d in sorted(needs.items(),
+                              key=lambda x: -x[1]["fp"] - x[1]["fn"]):
+            t_need.add_row(form, str(d["fp"]), str(d["fn"]))
+        _console.print(t_need)
+
+
+def _print_report_plain(result: dict):
     print("=" * _W)
     print(" 本地评分报告 v3   (对齐 README §6 官方公式)")
     print(f" Scope 模式: {'3元组 (v1 兼容)' if result['strict_scope'] else '4元组 (推荐)'}")
     print("=" * _W)
 
-    # ── [A] 分桶 F1 (官方 ①) ────────────────────────────────────
     print("\n[A] 分桶 F1 —— README §6.1 ①")
     print(f"{'形态':<20} {'F1':>6}  {'TP':>5} {'FP':>5} {'FN':>5}  {'权重':>5}")
     print("-" * _W)
@@ -237,7 +435,6 @@ def print_report(result: dict):
             d = result["form_detail"][form]
             print(f"   {form:<18} F1={d['f1']:.3f}  TP={d['tp']} FP={d['fp']} FN={d['fn']}")
 
-    # ── [B] 加权 F1 (官方 ②) ────────────────────────────────────
     print("-" * _W)
     print(f"[B] 加权 F1 = Σ(权重 × F1_form)  →  {result['weighted_f1']:.4f}")
     ceil_f1 = result["local_ceiling_f1"]
@@ -249,7 +446,6 @@ def print_report(result: dict):
               f"{result['uncovered_forms']}")
         print(f"             对应综合识别得分本地天花板: {ceil_comp:.4f}")
 
-    # ── [C] 等级准确率 (官方 ③) ──────────────────────────────────
     print(f"\n[C] 等级准确率 —— README §6.1 ③")
     print(f"    公式: 等级正确的TP数 / 答案总行数")
     print(f"    = {result['correct_level']} / {result['total_answer']}  "
@@ -258,13 +454,11 @@ def print_report(result: dict):
           f"{result['correct_level']}/{result['total_tp']} = "
           f"{result['level_acc_tp_only']:.4f}）")
 
-    # ── [D] 综合识别得分 (官方 ④ 靶机返回) ───────────────────────
     print(f"\n[D] 综合识别得分 = 加权F1×0.70 + 等级准确率×0.30")
     print(f"    = {result['weighted_f1']:.4f}×0.70 + "
           f"{result['level_acc_official']:.4f}×0.30")
     print(f"    = {result['comprehensive']:.4f}   ← 对应靶机返回值")
 
-    # ── [E] Value-only F1 (诊断) ────────────────────────────────
     print(f"\n[E] Value-only F1（忽略 data_form，诊断用）")
     print(f"    precision={result['value_precision']:.4f}  "
           f"recall={result['value_recall']:.4f}  "
@@ -276,7 +470,6 @@ def print_report(result: dict):
         print(f"        官方分桶会把这些条目计为 FP+FN（双重扣分），"
               f"修 dispatcher 路由逻辑能一次吃下两倍收益")
 
-    # ── [F] 数据概况 ────────────────────────────────────────────
     print(f"\n[F] 数据概况")
     print(f"    答案去重后总行数          : {result['total_answer']}")
     print(f"    预测原始总行数            : {result['total_pred_raw']}")
@@ -285,20 +478,25 @@ def print_report(result: dict):
           + (" (v1 会把这些算成 FP)" if not result['strict_scope'] else ""))
     print("=" * _W)
 
-    # ── 抽样提示 ────────────────────────────────────────────────
     print("")
     print("[i] example.csv 是 ~1% 抽样答案（README §五），本地分数只反映")
     print("    抽到的那部分的识别情况。靶机用完整答案集，实际分数会有差异；")
     print("    value_fp 中若看到大量合理敏感值，说明抽样遗漏的 TP 比较多，")
     print("    不要为了消灭它们而收紧正则，会反过来压低靶机 recall。")
 
-    # ── 关注提示 ────────────────────────────────────────────────
     needs = {f: d for f, d in result["form_detail"].items()
              if d["fp"] > 0 or d["fn"] > 0}
     if needs:
         print("\n[!] 需要关注的形态（有误报或漏报）：")
         for form, d in sorted(needs.items(), key=lambda x: -x[1]["fp"] - x[1]["fn"]):
             print(f"    {form:<20} FP={d['fp']:<4} FN={d['fn']:<4}")
+
+
+def print_report(result: dict):
+    if _RICH:
+        _print_report_rich(result)
+    else:
+        _print_report_plain(result)
 
 
 # ── 差异分析 ─────────────────────────────────────────────────────
@@ -331,19 +529,50 @@ def print_diff(answer_rows: list, pred_rows: list,
                 f"{r.get('sensitive_type',''):<22} "
                 f"= {r.get('extracted_value','')!r}")
 
-    if fn_keys:
-        print(f"\n── 漏报 (FN) {len(fn_keys)} 条 ──")
-        for k in sorted(fn_keys)[:limit]:
-            print("  " + _fmt(answer_map[k]))
-        if len(fn_keys) > limit:
-            print(f"  ... 还有 {len(fn_keys)-limit} 条（用 --limit N 调整）")
+    def _diff_table(title: str, title_style: str, border: str,
+                    keys, source_map):
+        t = Table(title=title, box=box.SIMPLE, title_justify="left",
+                  title_style=title_style, border_style=border)
+        t.add_column("form", style="cyan", no_wrap=True)
+        t.add_column("table.field", no_wrap=True)
+        t.add_column("id", justify="right", style="dim")
+        t.add_column("type", style="magenta")
+        t.add_column("value", overflow="fold")
+        for k in sorted(keys)[:limit]:
+            r = source_map[k]
+            t.add_row(
+                r.get(FORM_COL, ""),
+                f"{r.get('table_name','')}.{r.get('field_name','')}",
+                str(r.get("record_id", "")),
+                r.get("sensitive_type", ""),
+                repr(r.get("extracted_value", "")),
+            )
+        _console.print(t)
+        if len(keys) > limit:
+            _console.print(
+                f"[dim]  ... 还有 {len(keys)-limit} 条（用 --limit N 调整）[/]"
+            )
 
-    if fp_keys:
-        print(f"\n── 误报 (FP) {len(fp_keys)} 条 ──")
-        for k in sorted(fp_keys)[:limit]:
-            print("  " + _fmt(pred_map[k]))
-        if len(fp_keys) > limit:
-            print(f"  ... 还有 {len(fp_keys)-limit} 条（用 --limit N 调整）")
+    if _RICH:
+        if fn_keys:
+            _diff_table(f"漏报 (FN) {len(fn_keys)} 条", "bold yellow",
+                        "yellow", fn_keys, answer_map)
+        if fp_keys:
+            _diff_table(f"误报 (FP) {len(fp_keys)} 条", "bold red",
+                        "red", fp_keys, pred_map)
+    else:
+        if fn_keys:
+            print(f"\n── 漏报 (FN) {len(fn_keys)} 条 ──")
+            for k in sorted(fn_keys)[:limit]:
+                print("  " + _fmt(answer_map[k]))
+            if len(fn_keys) > limit:
+                print(f"  ... 还有 {len(fn_keys)-limit} 条（用 --limit N 调整）")
+        if fp_keys:
+            print(f"\n── 误报 (FP) {len(fp_keys)} 条 ──")
+            for k in sorted(fp_keys)[:limit]:
+                print("  " + _fmt(pred_map[k]))
+            if len(fp_keys) > limit:
+                print(f"  ... 还有 {len(fp_keys)-limit} 条（用 --limit N 调整）")
 
     if show_form_mismatch:
         mismatches = []
@@ -353,16 +582,44 @@ def print_diff(answer_rows: list, pred_rows: list,
             if af != pf:
                 mismatches.append((k, af, pf))
         if mismatches:
-            print(f"\n── Form 标错 {len(mismatches)} 条 （值对但 data_form 不同，"
-                  f"官方双重扣分）──")
-            for k, af, pf in mismatches[:limit]:
-                r = pred_map[k]
-                print(f"  答案form={af:<18} 预测form={pf:<18} | "
-                      f"{r.get('table_name','')}.{r.get('field_name','')} "
-                      f"id={r.get('record_id','')} "
-                      f"{r.get('sensitive_type','')} = {r.get('extracted_value','')!r}")
-            if len(mismatches) > limit:
-                print(f"  ... 还有 {len(mismatches)-limit} 条")
+            if _RICH:
+                t = Table(
+                    title=f"Form 标错 {len(mismatches)} 条"
+                          f"（值对但 data_form 不同，官方双重扣分）",
+                    box=box.SIMPLE, title_justify="left",
+                    title_style="bold yellow", border_style="yellow",
+                )
+                t.add_column("答案 form", style="green", no_wrap=True)
+                t.add_column("预测 form", style="red", no_wrap=True)
+                t.add_column("table.field", no_wrap=True)
+                t.add_column("id", justify="right", style="dim")
+                t.add_column("type", style="magenta")
+                t.add_column("value", overflow="fold")
+                for k, af, pf in mismatches[:limit]:
+                    r = pred_map[k]
+                    t.add_row(
+                        af, pf,
+                        f"{r.get('table_name','')}.{r.get('field_name','')}",
+                        str(r.get("record_id", "")),
+                        r.get("sensitive_type", ""),
+                        repr(r.get("extracted_value", "")),
+                    )
+                _console.print(t)
+                if len(mismatches) > limit:
+                    _console.print(
+                        f"[dim]  ... 还有 {len(mismatches)-limit} 条[/]"
+                    )
+            else:
+                print(f"\n── Form 标错 {len(mismatches)} 条 （值对但 data_form 不同，"
+                      f"官方双重扣分）──")
+                for k, af, pf in mismatches[:limit]:
+                    r = pred_map[k]
+                    print(f"  答案form={af:<18} 预测form={pf:<18} | "
+                          f"{r.get('table_name','')}.{r.get('field_name','')} "
+                          f"id={r.get('record_id','')} "
+                          f"{r.get('sensitive_type','')} = {r.get('extracted_value','')!r}")
+                if len(mismatches) > limit:
+                    print(f"  ... 还有 {len(mismatches)-limit} 条")
 
 
 # ── 入口 ─────────────────────────────────────────────────────────

@@ -97,6 +97,9 @@ def get_connection(db_type: str, db_name: str):
             except Exception:
                 pass
             return conn
+    except Exception as e:
+        print(f"[ERROR] 连接失败 {db_type}/{db_name}: {e}")
+        return None
 
 
 def get_all_tables(conn, db_type: str, db_name: str) -> list:
