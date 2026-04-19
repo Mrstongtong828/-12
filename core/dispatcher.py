@@ -24,7 +24,7 @@ from scanners.encoded import (
 )
 from scanners.unstructured import scan_unstructured_field, is_unstructured_text
 from scanners.blob import scan_blob_field
-
+_NOISE_VALUE_RE = re.compile(r"^N/A_\d+$")
 _HEX_CHARS_DISPATCH = re.compile(r'^[0-9a-fA-F]+$')
 
 _PWD_FIELD_RE = re.compile(
