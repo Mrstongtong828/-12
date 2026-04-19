@@ -5,8 +5,10 @@ from core.config import SENSITIVE_LEVEL_MAP, LEAF_TEXT_MAX_LEN
 from core.patterns import (
     extract_sensitive_from_value, match_field_name,
     extract_by_field_hint,
-    is_valid_address,              # [新增]
+    is_valid_address,              
     is_name_fp_field,              # [FP-fix P0-A]
+    is_job_title_name,             # [Fix #1] 2-4字名路径过滤职务称谓
+    COMPOUND_SURNAMES,             # [Fix #1] 2-4字名路径检测复姓锚点
     _SURNAMES_SET, NAME_BLACKLIST, _FIELD_NAME_COMPILED, _NAME_BLACKLIST_RE,
 )
 
@@ -144,6 +146,7 @@ def _regex_fallback_scan(value_str, field_name, record_id, table_name,
                         field_col_name, db_type, db_name, data_form):
     findings = []
     field_hints = None
+    emitted_names = set()  # [Fix #1] 跟踪已 emit 的 CHINESE_NAME,避免短名兜底重复
 
     for stype, val in extract_sensitive_from_value(value_str):
         if stype == "CHINESE_NAME":
@@ -156,6 +159,7 @@ def _regex_fallback_scan(value_str, field_name, record_id, table_name,
                         and val[0] in _SURNAMES_SET
                         and not _NAME_BLACKLIST_RE.search(val)):
                     continue
+            emitted_names.add(val)
         elif stype == "ADDRESS":
             if not is_valid_address(val, strict=True):
                 continue
@@ -165,6 +169,35 @@ def _regex_fallback_scan(value_str, field_name, record_id, table_name,
             record_id, data_form, stype, val,
         ))
 
+    # ── [Fix #1] 结构化字段名强匹配 CHINESE_NAME,且整值是 2-4 字纯中文时,
+    # 走宽松路径:首字是姓氏(或复姓 bigram)+ 非黑名单 + 非职务后缀 → 直接接受。
+    # 主要救:
+    #   1. 2 字名(如 居晸/曾榜/魏晴,try_name_at 根本不尝试 2 字)
+    #   2. 复姓中含"乡"等地址字的名字(如 东乡霜,被 _NAME_ADDR_CHARS 误拒)
+    # 安全约束:
+    #   - 只在 structured 形态跑,不污染 unstructured_text 的自然语言扫描
+    #   - 字段名必须已命中 CHINESE_NAME 白名单(real_name/consignee/holder_name 等),
+    #     上下文极强,不放开姓氏外的字形检测也是安全的
+    if (data_form == "structured"
+            and 2 <= len(value_str) <= 4
+            and value_str not in emitted_names
+            and not is_name_fp_field(field_name)
+            and all('\u4e00' <= c <= '\u9fa5' for c in value_str)
+            and not _NAME_BLACKLIST_RE.search(value_str)
+            and not is_job_title_name(value_str)):
+        if field_hints is None:
+            field_hints = match_field_name(field_name)
+        if "CHINESE_NAME" in field_hints:
+            has_surname_anchor = (
+                value_str[0] in _SURNAMES_SET
+                or value_str[:2] in COMPOUND_SURNAMES
+            )
+            if has_surname_anchor:
+                findings.append(_make_finding(
+                    db_type, db_name, table_name, field_col_name,
+                    record_id, data_form, "CHINESE_NAME", value_str,
+                ))
+
     for stype, val in extract_by_field_hint(field_name, value_str):
         findings.append(_make_finding(
             db_type, db_name, table_name, field_col_name,
@@ -172,7 +205,6 @@ def _regex_fallback_scan(value_str, field_name, record_id, table_name,
         ))
 
     return findings
-
 
 def scan_structured_field(field_name, value, record_id, table_name,
                            field_col_name, db_type, db_name):
