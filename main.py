@@ -84,6 +84,40 @@ def _estimate_row_count(conn, db_type: str, db_name: str, table_name: str) -> in
     except Exception:
         pass
     return 0
+def _has_blob_column(conn, db_type: str, db_name: str, table_name: str) -> bool:
+    """
+    检测表是否含 BLOB/BYTEA 等二进制列。
+    用途:这类表限制扫描行数,避免 OCR 子进程大量失败时白白烧完 300s 单表预算。
+    查询失败(权限等)默认返 False,走正常流程,不阻塞扫描。
+    """
+    try:
+        if db_type == "mysql":
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
+                    "  AND DATA_TYPE IN "
+                    "    ('blob','tinyblob','mediumblob','longblob',"
+                    "     'binary','varbinary')",
+                    (db_name, table_name),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                cnt = row.get("cnt") if isinstance(row, dict) else row[0]
+                return int(cnt or 0) > 0
+        elif db_type == "postgresql":
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_name = %s AND data_type = 'bytea'",
+                    (table_name,),
+                )
+                row = cur.fetchone()
+                return int(row[0] or 0) > 0 if row else False
+    except Exception:
+        pass
+    return False
 
 
 def _sampled_rows(conn, db_type: str, table_name: str, pk_col):
