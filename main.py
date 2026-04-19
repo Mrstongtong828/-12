@@ -208,20 +208,27 @@ def _sampled_rows(conn, db_type: str, table_name: str, pk_col):
 
 # ── 单表扫描 ─────────────────────────────────────────────────────
 def _scan_table(conn, db_type, db_name, table_name, writer, log: ScanLogger, label: str):
+    import itertools   # 本地 import,避免污染模块顶层
+
     pk_col = get_primary_key_col(conn, db_type, db_name, table_name)
     row_count = 0
     hit_count = 0
-
-    # [#13] 本地 buffer，减少锁争用
     local_buffer = []
 
-    # [#11] 估算行数，决定走全扫还是抽样
+    # [新增] 先探 BLOB 列,决定是否要限行
+    is_blob_table = _has_blob_column(conn, db_type, db_name, table_name)
+
     estimated = _estimate_row_count(conn, db_type, db_name, table_name)
     if estimated > SAMPLE_THRESHOLD:
         row_iter = _sampled_rows(conn, db_type, table_name, pk_col)
         log.info(label, f"表 {table_name} 估算 {estimated:,} 行，启用分层抽样")
     else:
         row_iter = stream_table_rows(conn, db_type, table_name, pk_col)
+
+    # [新增] BLOB 表硬截断到 BLOB_TABLE_MAX_ROWS 行
+    if is_blob_table:
+        log.info(label, f"表 {table_name} 含 BLOB 列，限制最多扫 {BLOB_TABLE_MAX_ROWS} 行")
+        row_iter = itertools.islice(row_iter, BLOB_TABLE_MAX_ROWS)
 
     deadline = time.time() + TABLE_TIMEOUT_SECONDS
     for pk_value, row in row_iter:
@@ -242,7 +249,6 @@ def _scan_table(conn, db_type, db_name, table_name, writer, log: ScanLogger, lab
                     _flush_buffer(writer, local_buffer)
         row_count += 1
 
-    # 表扫完后把 buffer 刷一次
     _flush_buffer(writer, local_buffer)
     return row_count, hit_count
 
