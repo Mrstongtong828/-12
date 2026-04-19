@@ -4,6 +4,11 @@ import urllib.parse
 from core.patterns import extract_sensitive_from_value, REGEX_PATTERNS
 from core.config import SENSITIVE_LEVEL_MAP
 
+MAX_DECODE_DEPTH = 5          # 递归深度上限
+MAX_DECODED_LEN = 200_000     # 单步解码后长度上限
+MAX_CUMULATIVE_RATIO = 10     # 累计膨胀比(末值长度 / 初始长度)
+
+
 PASSWORD_FIELD_KEYWORDS = {"password", "passwd", "pwd", "secret", "token",
                             "api_key", "apikey", "private_key", "secret_key"}
 
@@ -124,10 +129,20 @@ def _try_unicode_unescape(s: str):
     except Exception:
         return None
 
-
-def decode_recursive(value_str: str, max_rounds: int = 5):
+def decode_recursive(value_str: str, max_rounds: int = MAX_DECODE_DEPTH):
+    """
+    递归解码链,带四重防御:
+      1. 深度上限: max_rounds 轮
+      2. 单步长度上限: 解码后 > MAX_DECODED_LEN → 截停
+      3. 循环自指检测: 中间串已见过 → 截停
+      4. 累计膨胀比上限: 末值/初值 > MAX_CUMULATIVE_RATIO → 截停
+    任何一闸触发都静默停止,返回当前最后合法结果 + 已完成的 chain。
+    """
     current = value_str
     chain = []
+    seen = {current}
+    initial_len = max(1, len(value_str))
+
     for _ in range(max_rounds):
         changed = False
         for decode_fn, label in [
@@ -137,15 +152,29 @@ def decode_recursive(value_str: str, max_rounds: int = 5):
             (_try_unicode_unescape, "unicode"),
         ]:
             result = decode_fn(current)
-            if result and result != current:
-                chain.append(label)
-                current = result
-                changed = True
-                break
+            if result is None or result == current:
+                continue
+
+            # 闸 2: 单步长度
+            if len(result) > MAX_DECODED_LEN:
+                return current, chain
+            # 闸 3: 循环自指
+            if result in seen:
+                return current, chain
+            # 闸 4: 累计膨胀比
+            if len(result) / initial_len > MAX_CUMULATIVE_RATIO:
+                return current, chain
+
+            chain.append(label)
+            current = result
+            seen.add(current)
+            changed = True
+            break
+
         if not changed:
             break
-    return current, chain
 
+    return current, chain
 
 def _decoded_looks_sensitive(decoded: str) -> bool:
     """
