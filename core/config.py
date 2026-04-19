@@ -1,5 +1,6 @@
 import os
 
+
 DB_CONFIGS = {
     "mysql": {
         "host": "127.0.0.1",
@@ -72,3 +73,10 @@ LEAF_TEXT_MAX_LEN = 5_000
 DB_WORKERS = 1
 # CSV 写入缓冲区：每个 DB 线程攒够 N 条才统一 flush，降低锁竞争
 WRITER_BUFFER_SIZE = 100
+# ── BLOB 表行数保护 ──────────────────────────────────────────────
+# 含 BLOB/BYTEA 列的表,无论估算行数多少,最多只扫这么多行。
+# 理由:每张图 OCR 哪怕全走本地子进程,也比纯正则贵 2-3 个数量级;
+#      一个几千行的 user_attachments 会把 TABLE_TIMEOUT_SECONDS 烧光,
+#      而抽样扫 80 行对 F1 的覆盖已经够用(example.csv 里 binary_blob
+#      抽样本来就很稀疏)。
+BLOB_TABLE_MAX_ROWS = 80
