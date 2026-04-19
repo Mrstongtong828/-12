@@ -1,20 +1,16 @@
 """
 BLOB/图片/文档扫描器。
 
-演进历程:
-  v1 : 本进程直接跑 PaddleOCR(Windows + CPU 段错误会杀进程) → 放弃
-  v2 : OCR 外包给子进程(scanners.ocr_worker),本地只负责正则匹配
-  v3 : 增加文件魔数嗅探,PDF/DOCX/XLSX 直接抽文本,不走 OCR
-       扫描版 PDF(抽不到文字)每页转图 fallback 到 OCR 子进程
+v3 特性:
+  - 文件魔数嗅探: PDF / DOCX / XLSX / IMAGE / UNKNOWN 五路分发
+  - PDF 优先抽数字文本,扫描版 fallback 到 OCR 子进程
+  - DOCX / XLSX 懒加载(库未装时静默返空)
+  - OCR 路径预处理:长数字串空格合并、label 冒号规整
+  - OCR 数字类纠错(O→0 / I→1 等),只作用于图片路径
 
 对外 API 不变:
   scan_blob_field(blob_bytes, record_id, table_name,
                   field_col_name, db_type, db_name) -> list[finding]
-  扫描结果的 data_form 固定为 "binary_blob"
-
-延迟加载策略:
-  PyMuPDF / python-docx / openpyxl 全部懒加载。任一库未装,对应文件类型
-  路径静默返空,不影响其它类型扫描,也不影响进程启动。
 """
 import re
 import io
@@ -25,9 +21,9 @@ from scanners.ocr_client import get_ocr_text, ocr_disabled
 
 
 # ── 文档解析参数 ─────────────────────────────────────────────────
-PDF_MAX_PAGES = 20           # 单个 PDF 最多处理页数(防大文件吃光内存)
-PDF_OCR_DPI = 150            # 扫描版 PDF 转图时的分辨率
-DOC_TEXT_MAX_LEN = 500_000   # 单文档抽取文本长度上限
+PDF_MAX_PAGES = 20
+PDF_OCR_DPI = 150
+DOC_TEXT_MAX_LEN = 500_000
 
 
 # ── 延迟加载容器 ─────────────────────────────────────────────────
@@ -92,11 +88,37 @@ _DIGIT_LIKE = re.compile(r"[0-9OoIlSBZGT]{6,}")
 
 
 def correct_ocr_text(text: str) -> str:
-    """只在形似数字串的片段上替换,纯英文单词不受影响。"""
     def _correct_segment(m):
         seg = m.group()
         return "".join(OCR_CORRECTION_MAP.get(c, c) for c in seg)
     return _DIGIT_LIKE.sub(_correct_segment, text)
+
+
+# ── OCR 文本预处理(合并空格切碎的长数字串 + label 规整) ──────────
+_OCR_SPACE_IN_LONGNUM = re.compile(r"(\d)\s+(\d)")
+_OCR_LABEL_COLON = re.compile(
+    r"(姓名|名字|客户名|联系人|身份证号|身份证|手机|电话|联系电话|"
+    r"银行卡号|卡号|病历号|就诊号|住址|地址|邮箱|邮件)\s*[:\uff1a]\s*",
+)
+
+
+def _preprocess_ocr_text(text: str) -> str:
+    """
+    OCR 文本预处理(仅作用于图片路径):
+      - label 冒号规整(全角半角冒号统一成无空格半角)
+      - 合并被空格切碎的长数字串:
+          "440106 19900101 1234" → "440106199001011234"
+        2 轮足够把 "6-6-6" 格式合成 18 位
+    """
+    if not text:
+        return text
+    text = _OCR_LABEL_COLON.sub(lambda m: m.group(1) + ":", text)
+    for _ in range(2):
+        new = _OCR_SPACE_IN_LONGNUM.sub(r"\1\2", text)
+        if new == text:
+            break
+        text = new
+    return text
 
 
 # ── finding 构造 ─────────────────────────────────────────────────
@@ -118,7 +140,6 @@ def _make_finding(db_type, db_name, table_name, field_col_name,
 
 # ── 字节规范化 ───────────────────────────────────────────────────
 def _normalize_to_bytes(blob):
-    """把入参统一成 bytes;无法识别返 None。"""
     if blob is None:
         return None
     if isinstance(blob, memoryview):
@@ -127,7 +148,6 @@ def _normalize_to_bytes(blob):
         return bytes(blob)
     if isinstance(blob, bytes):
         return blob
-    # psycopg2 某些版本把 BYTEA 返回成 "\\x..." 十六进制字符串
     if isinstance(blob, str):
         s = blob.strip()
         if s.startswith(r'\x') and len(s) > 4 and (len(s) - 2) % 2 == 0:
@@ -141,18 +161,12 @@ def _normalize_to_bytes(blob):
 
 # ── 文件类型嗅探 ─────────────────────────────────────────────────
 def _sniff_file_type(data: bytes) -> str:
-    """
-    返回 'pdf' / 'docx' / 'xlsx' / 'image' / 'unknown'
-    docx/xlsx 是 zip 包,需进一步嗅探内部结构。
-    """
     if not data or len(data) < 8:
         return "unknown"
 
-    # PDF
     if data[:4] == b'%PDF':
         return "pdf"
 
-    # 图片(覆盖 JPEG/PNG/GIF/BMP/WEBP)
     if (data[:2] == b'\xff\xd8'
             or data[:4] == b'\x89PNG'
             or data[:4] == b'GIF8'
@@ -160,25 +174,20 @@ def _sniff_file_type(data: bytes) -> str:
             or data[:4] == b'RIFF'):
         return "image"
 
-    # ZIP 魔数(docx/xlsx/一般 zip 都是 PK\x03\x04)
     if data[:4] == b'PK\x03\x04':
         head = data[:4096]
-        # docx 特征
         if b'word/document.xml' in head or b'word/' in head:
             return "docx"
-        # xlsx 特征
         if b'xl/workbook.xml' in head or b'xl/' in head:
             return "xlsx"
-        # Content_Types 存在但没有明确的 word/xl 前缀
         if b'[Content_Types].xml' in head:
-            # 默认按 docx 试,失败会在解析阶段静默返空
             return "docx"
         return "unknown"
 
     return "unknown"
 
 
-# ── PDF 文本抽取(数字版优先,扫描版 fallback OCR) ────────────────
+# ── PDF 文本抽取 ─────────────────────────────────────────────────
 def _extract_pdf_text(data: bytes) -> str:
     fitz = _get_pymupdf()
     if fitz is None:
@@ -245,14 +254,12 @@ def _extract_docx_text(data: bytes) -> str:
         doc = docx_lib.Document(io.BytesIO(data))
         texts = []
         total = 0
-        # 段落
         for para in doc.paragraphs:
             if para.text:
                 texts.append(para.text)
                 total += len(para.text)
                 if total > DOC_TEXT_MAX_LEN:
                     break
-        # 表格(敏感数据常在表格里)
         if total < DOC_TEXT_MAX_LEN:
             for table in doc.tables:
                 for row in table.rows:
@@ -305,7 +312,7 @@ def _extract_xlsx_text(data: bytes) -> str:
         return ""
 
 
-# ── 扫描结果组装(统一去重 + finding 包装) ──────────────────────
+# ── 扫描结果组装 ─────────────────────────────────────────────────
 def _collect_findings(text, record_id, table_name, field_col_name,
                       db_type, db_name, apply_ocr_correction=False):
     """
@@ -348,8 +355,7 @@ def scan_blob_field(blob_bytes, record_id, table_name, field_col_name,
       2. 文件魔数嗅探,路由到 PDF / DOCX / XLSX / IMAGE / UNKNOWN
       3. PDF:先抽数字文本,失败再转图 OCR
          DOCX/XLSX:直接抽文本(需对应库可用,否则返空)
-         IMAGE/UNKNOWN:走 OCR 子进程
-      4. 抽出的文本跑敏感正则,图片路径额外跑一遍数字纠错文本
+         IMAGE/UNKNOWN:走 OCR 子进程 + 预处理 + 数字纠错
     """
     data = _normalize_to_bytes(blob_bytes)
     if not data:
@@ -378,12 +384,13 @@ def scan_blob_field(blob_bytes, record_id, table_name, field_col_name,
             db_type, db_name, apply_ocr_correction=False,
         )
 
-    # 图片 / 未知 → OCR 子进程
+    # 图片 / 未知 → OCR 子进程 + 预处理 + 数字纠错
     if ocr_disabled():
         return []
     raw_text = get_ocr_text(data)
     if not raw_text:
         return []
+    raw_text = _preprocess_ocr_text(raw_text)
     return _collect_findings(
         raw_text, record_id, table_name, field_col_name,
         db_type, db_name, apply_ocr_correction=True,
