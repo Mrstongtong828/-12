@@ -39,6 +39,9 @@ _HAS_LETTER = re.compile(r"[a-zA-Z]")
 _HAS_AF = re.compile(r"[a-fA-F]")
 _HAS_CHINESE = re.compile(r"[\u4e00-\u9fa5]")
 _UNICODE_ESC = re.compile(r"\\u[0-9a-fA-F]{4}")
+# 无反斜杠的伪 unicode:u8d35u5dde 连写。仅当连续 ≥3 个 token 才认。
+_PSEUDO_UNICODE_ESC = re.compile(r"(?:u[0-9a-fA-F]{4}){3,}")
+_PSEUDO_UNICODE_TOKEN = re.compile(r"u([0-9a-fA-F]{4})")
 _PERCENT_ENC = re.compile(r"%[0-9a-fA-F]{2}")
 # 快速预检:base64 合法字符集(避免对非 base64 串走完整解码)
 _B64_CHARS = re.compile(r"^[A-Za-z0-9+/\-_=]+$")
@@ -152,6 +155,44 @@ def _try_unicode_unescape(s: str):
         return None
 
 
+def _try_pseudo_unicode_unescape(s: str):
+    """
+    无反斜杠的伪 unicode 转义:u8d35u5dde... 连写形式。
+
+    触发条件:字符串中出现连续 ≥3 个 u+4位十六进制 token(避免把
+    英文 'user1234' 这种误判)。
+
+    一旦触发,则将字符串内所有 u[hex]{4} token 全部解码——地址里数字
+    (如 '242号946室' → 'u...u9547242u53f7946u5ba4')会打断长串,但
+    整体仍属伪 unicode 明文,不能漏掉尾部零散 token。
+    """
+    if not _PSEUDO_UNICODE_ESC.search(s):
+        return None
+    try:
+        decoded = _PSEUDO_UNICODE_TOKEN.sub(
+            lambda m: chr(int(m.group(1), 16)), s
+        )
+        return decoded if decoded != s else None
+    except Exception:
+        return None
+
+
+def _looks_like_pure_hex(s: str) -> bool:
+    """判断字符串是否"纯 hex 特征":长度 >= 20、长度为偶数、全 hex 字符、含 a-f。
+
+    这类串既是合法 base64 又是合法 hex,但 base64 解码会产生高位字节垃圾。
+    所以必须优先走 hex 路径。
+    """
+    stripped = s.strip()
+    if len(stripped) < 20 or len(stripped) % 2 != 0:
+        return False
+    if not _HEX_CHARS.match(stripped):
+        return False
+    if not _HAS_AF.search(stripped):
+        return False
+    return True
+
+
 def decode_recursive(value_str: str, max_rounds: int = MAX_DECODE_DEPTH,
                      collect_intermediate: bool = False):
     """
@@ -173,12 +214,28 @@ def decode_recursive(value_str: str, max_rounds: int = MAX_DECODE_DEPTH,
 
     for _ in range(max_rounds):
         changed = False
-        for decode_fn, label in [
-            (_try_url_decode, "url"),
-            (_try_base64_decode, "base64"),
-            (_try_hex_decode, "hex"),
-            (_try_unicode_unescape, "unicode"),
-        ]:
+        # [关键] 如果看起来是纯 hex,优先走 hex;否则标准优先级。
+        # 理由:纯 hex 字符同时也是合法 base64 字符集,base64 先解码会产生
+        # 二进制垃圾,掩盖真实 hex 明文(example.csv 里 credit_report 等表
+        # 就是这种情况)。
+        if _looks_like_pure_hex(current):
+            decode_order = [
+                (_try_hex_decode, "hex"),
+                (_try_url_decode, "url"),
+                (_try_base64_decode, "base64"),
+                (_try_unicode_unescape, "unicode"),
+                (_try_pseudo_unicode_unescape, "pseudo_unicode"),
+            ]
+        else:
+            decode_order = [
+                (_try_url_decode, "url"),
+                (_try_base64_decode, "base64"),
+                (_try_hex_decode, "hex"),
+                (_try_unicode_unescape, "unicode"),
+                (_try_pseudo_unicode_unescape, "pseudo_unicode"),
+            ]
+
+        for decode_fn, label in decode_order:
             result = decode_fn(current)
             if result is None or result == current:
                 continue
@@ -257,6 +314,9 @@ def _is_encoded_value(s: str) -> bool:
     if _PERCENT_ENC.search(stripped):
         return True
     if _UNICODE_ESC.search(stripped):
+        return True
+    # 伪 unicode(无反斜杠):u8d35u5dde... 连续 ≥3 token
+    if _PSEUDO_UNICODE_ESC.search(stripped):
         return True
 
     # base64:除了能解码外,还要求解码结果"看起来有价值"
