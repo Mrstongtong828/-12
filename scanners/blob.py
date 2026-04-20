@@ -73,7 +73,7 @@ def _get_openpyxl():
 # ═══════════════════════════════════════════════════════════════
 OCR_CORRECTION_MAP = {
     'O': '0', 'o': '0', 'Q': '0', 'D': '0',
-    'I': '1', 'l': '1', 'i': '1', '|': '1',
+    'I': '1', 'l': '1', 'i': '1', '|': '1', 'L': '1',
     'Z': '2', 'z': '2',
     'S': '5', 's': '5',
     'G': '6', 'b': '6',
@@ -81,8 +81,11 @@ OCR_CORRECTION_MAP = {
     'B': '8',
     'g': '9', 'q': '9',
 }
-# 匹配至少6个字符的数字疑似串
+# 匹配至少6个字符的数字疑似串 (加入 L 大写以增强银行卡/身份证召回)
 _DIGIT_LIKE = re.compile(r"[0-9OoQDIlLiZzSsGbTBgq|]{6,}")
+
+# [新增] 纯数字长窗口正则:用于 OCR 后仍有粘连的长数字块兜底(银行卡/身份证)
+_LONG_DIGIT_WINDOW = re.compile(r"\d{13,20}")
 
 def correct_ocr_text(text: str) -> str:
     """
@@ -101,7 +104,7 @@ def correct_ocr_text(text: str) -> str:
                 return front + 'X'
         # 通用数字纠错
         return "".join(OCR_CORRECTION_MAP.get(c, c) for c in seg)
-    
+
     return _DIGIT_LIKE.sub(_correct_segment, text)
 
 
@@ -253,10 +256,65 @@ def _normalize_to_bytes(blob):
     if isinstance(blob, bytes): return blob
     if isinstance(blob, str):
         s = blob.strip()
+        # ① PostgreSQL \x 十六进制
         if s.startswith(r'\x') and len(s) > 4 and (len(s) - 2) % 2 == 0:
             try: return bytes.fromhex(s[2:])
             except ValueError: return None
+        # ② 裸十六进制(无 \x 前缀),长度 > 100 且全 hex
+        if len(s) > 100 and len(s) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in s):
+            try: return bytes.fromhex(s)
+            except ValueError: pass
     return None
+
+
+def _unwrap_encoded_blob(data: bytes) -> bytes:
+    """
+    BLOB 套娃解码兜底:部分题目 BLOB 实际存的不是原始图片,而是
+      - base64 → 图片
+      - hex → base64 → 图片
+    等嵌套形式。通过尝试 base64/hex 单层解码,若解码结果以图片 magic 起头,
+    则返回解码后的字节,让 _sniff_file_type 识别为 image。
+    仅做一层解码,避免过度尝试拖慢 OCR 主流程。
+    """
+    if not data or len(data) < 80:
+        return data
+
+    # 只处理"ASCII-only"的 BLOB(原始图片字节含大量非 ASCII,绝不会误触)
+    try:
+        text = data.decode("ascii", errors="strict").strip()
+    except UnicodeDecodeError:
+        return data
+
+    # 尝试 base64
+    if len(text) > 80 and all(c in
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=-_\r\n"
+            for c in text):
+        try:
+            import base64 as _b64
+            compact = text.replace("\n", "").replace("\r", "")
+            padded = compact + "=" * (-len(compact) % 4)
+            if "-" in compact or "_" in compact:
+                raw = _b64.urlsafe_b64decode(padded)
+            else:
+                raw = _b64.b64decode(padded, validate=False)
+            if any(raw.startswith(m) for m in (
+                    b'\xff\xd8', b'\x89PNG', b'GIF8', b'BM', b'RIFF', b'%PDF')):
+                return raw
+        except Exception:
+            pass
+
+    # 尝试 hex
+    if len(text) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in text):
+        try:
+            raw = bytes.fromhex(text)
+            if any(raw.startswith(m) for m in (
+                    b'\xff\xd8', b'\x89PNG', b'GIF8', b'BM', b'RIFF', b'%PDF')):
+                return raw
+        except Exception:
+            pass
+
+    return data
+
 
 def _sniff_file_type(data: bytes) -> str:
     if not data or len(data) < 8: return "unknown"
@@ -270,6 +328,32 @@ def _sniff_file_type(data: bytes) -> str:
         if b'xl/workbook.xml' in head or b'xl/' in head:
             return "xlsx"
     return "unknown"
+
+
+def _bytes_as_text_fallback(data: bytes) -> str:
+    """
+    BLOB 无法识别文件类型 / OCR 返回空时的最后兜底:
+    将原始字节按多种编码尝试解码,提取出其中的 ASCII/UTF-8 可打印文本,
+    交给正则管线做一次扫描。覆盖"BLOB 里其实塞了明文 + 少量控制字符"场景。
+    """
+    if not data or len(data) < 16:
+        return ""
+    texts = []
+    for enc in ("utf-8", "gbk", "latin-1"):
+        try:
+            t = data.decode(enc, errors="ignore")
+            # 过滤不可打印字符,只保留常规文本 + 中文
+            clean = "".join(
+                c for c in t
+                if c.isprintable() or c in "\n\r\t"
+                or '\u4e00' <= c <= '\u9fa5'
+            )
+            if len(clean) > 20:
+                texts.append(clean)
+                break
+        except Exception:
+            continue
+    return "\n".join(texts)[:DOC_TEXT_MAX_LEN]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -361,6 +445,74 @@ def _extract_xlsx_text(data: bytes) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
+# 数字窗口独立扫描 —— 银行卡/身份证/手机号强力兜底
+# ═══════════════════════════════════════════════════════════════
+from core.patterns import (
+    REGEX_PATTERNS, validate_id_card, validate_luhn,
+)
+
+def _scan_digit_windows(text: str):
+    """
+    提取所有"长数字窗口"(连续 13-20 位纯数字)并针对 BANK_CARD/ID_CARD/
+    PHONE_NUMBER/MEDICAL_RECORD_NO 独立校验。
+
+    动机:OCR 输出常含"6228 4893 3712 3901 69"这类空格分组,
+    经 _preprocess_ocr_text 后多数可合并,但若中间混入罕见字符(如 ·/-/·)
+    会破坏 _collect_findings_multipath 的常规正则。这里做"只保留数字"
+    的最终兜底,极限拉升 binary_blob 层 BANK_CARD/ID_CARD 召回。
+    """
+    results = []
+    seen = set()
+
+    def _add(stype, val):
+        key = (stype, val)
+        if key not in seen:
+            seen.add(key)
+            results.append((stype, val))
+
+    # 宽松提取所有可能的长"数字串"(允许非数字分隔符)
+    # 限定字符集: 数字 + 常见分隔符(空格/-/·/中文空格)
+    # 最低阈值 11 以覆盖 "138 0013 8000" 的手机号场景
+    candidate_runs = re.findall(
+        r"[\d\s\-·•\u3000]{11,40}",
+        text,
+    )
+
+    for run in candidate_runs:
+        digits_only = re.sub(r"\D", "", run)
+        if not (11 <= len(digits_only) <= 20):
+            continue
+
+        # PHONE_NUMBER: 正好 11 位, 1[3-9] 开头 (优先,因为最短)
+        if len(digits_only) == 11 and digits_only[0] == "1" and digits_only[1] in "3456789":
+            _add("PHONE_NUMBER", digits_only)
+            continue
+
+        # ID_CARD: 正好 18 位
+        if len(digits_only) == 18:
+            if validate_id_card(digits_only):
+                _add("ID_CARD", digits_only)
+                continue
+
+        # BANK_CARD: 15-19 位, 首位 3-9, 宽松通过(OCR 场景不强制 Luhn)
+        if 15 <= len(digits_only) <= 19 and digits_only[0] in "356789":
+            # 排除已被识别为 ID_CARD 的 18 位
+            if len(digits_only) == 18 and validate_id_card(digits_only):
+                continue
+            _add("BANK_CARD", digits_only)
+
+    # 也要单独做纯 11 位手机号窗口兜底(长窗口中可能有连续11位子串)
+    for m in re.finditer(r"(?<!\d)1[3-9]\d{9}(?!\d)", text):
+        _add("PHONE_NUMBER", m.group())
+
+    # MEDICAL_RECORD_NO: MR + 9 位数字,OCR 常把 MR 拆成独立 token
+    for m in re.finditer(r"\b[Mm][Rr]\s*(\d{9})\b", text):
+        _add("MEDICAL_RECORD_NO", "MR" + m.group(1))
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════
 # 核心引擎：多路径扫描去重 (防止单点失效)
 # ═══════════════════════════════════════════════════════════════
 def _collect_findings_multipath(text, record_id, table_name, field_col_name,
@@ -369,6 +521,10 @@ def _collect_findings_multipath(text, record_id, table_name, field_col_name,
     核心战术：通过四条路径(原样、修数字、修汉字、双修)提取。
     任一路径命中且符合 patterns.py 规范的数据，都会被合并去重。
     极大缓解 OCR 极其恶劣情况下的漏报问题。
+
+    [v5.2 加强] 追加两条独立扫描路径:
+      ⑤ 数字窗口兜底 —— BANK_CARD/ID_CARD/PHONE_NUMBER 的 last-resort
+      ⑥ OCR 文本内部再做一次递归解码(处理 OCR 识别出 base64/hex 明文)
     """
     if not text:
         return []
@@ -390,18 +546,39 @@ def _collect_findings_multipath(text, record_id, table_name, field_col_name,
 
     findings = []
     seen = set()
+
+    def _emit(stype, val):
+        key = (stype, val)
+        if key in seen:
+            return
+        seen.add(key)
+        findings.append(_make_finding(
+            db_type, db_name, table_name, field_col_name,
+            record_id, stype, val,
+        ))
+
+    # 主扫描路径:原文 + 修数字 + 修汉字 + 双修
     for scan_text in paths:
-        # 调用我们已调优的 patterns.py 底层引擎
         for stype, val in extract_sensitive_from_value(scan_text):
-            key = (stype, val)
-            if key in seen:
-                continue
-            seen.add(key)
-            findings.append(_make_finding(
-                db_type, db_name, table_name, field_col_name,
-                record_id, stype, val,
-            ))
-            
+            _emit(stype, val)
+
+    # [兜底 ⑤] 数字窗口独立扫描(所有路径合并)
+    for scan_text in paths:
+        for stype, val in _scan_digit_windows(scan_text):
+            _emit(stype, val)
+
+    # [兜底 ⑥] OCR 文本内部可能出现的 base64/hex 编码串(罕见但存在)
+    try:
+        from scanners.encoded import decode_recursive as _dec
+        # 对 OCR 文本中长度 > 40 的 token 逐个尝试解码
+        for token in re.findall(r"[A-Za-z0-9+/=]{40,}", text):
+            decoded, chain = _dec(token)
+            if chain and decoded != token:
+                for stype, val in extract_sensitive_from_value(decoded):
+                    _emit(stype, val)
+    except Exception:
+        pass
+
     return findings
 
 def _collect_findings_simple(text, record_id, table_name, field_col_name,
@@ -429,12 +606,21 @@ def scan_blob_data(blob_bytes, record_id, table_name, field_col_name,
     """
     BLOB / 文档 / 图像 字段扫描统一入口。
     供 encoded.py 和底层核心引擎调用。
+
+    [v5.2] 识别流程新增套娃解码 + 字节级文本兜底,
+    确保 binary_blob 形态下任何一种编码嵌套都不会漏扫。
     """
     data = _normalize_to_bytes(blob_bytes)
     if not data:
         return []
 
+    # [新增] 套娃解码:BLOB 字段可能是 base64/hex 包裹的图片
     ftype = _sniff_file_type(data)
+    if ftype == "unknown":
+        unwrapped = _unwrap_encoded_blob(data)
+        if unwrapped is not data:
+            data = unwrapped
+            ftype = _sniff_file_type(data)
 
     if ftype == "pdf":
         raw_text = _extract_pdf_text(data)
@@ -449,19 +635,43 @@ def scan_blob_data(blob_bytes, record_id, table_name, field_col_name,
         return _collect_findings_simple(raw_text, record_id, table_name, field_col_name, db_type, db_name)
 
     # 图像或未知格式 -> 触发高规格容错处理: OCR + 预处理 + 多路径扫描
-    if ocr_disabled():
-        return []
-        
-    raw_text = get_ocr_text(data)
-    if not raw_text:
-        return []
-        
-    processed = _preprocess_ocr_text(raw_text)
-    
-    return _collect_findings_multipath(
-        processed, record_id, table_name, field_col_name,
-        db_type, db_name,
-    )
+    findings = []
+    seen_keys = set()
+
+    def _merge(hits):
+        for h in hits:
+            key = (h["sensitive_type"], h["extracted_value"])
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            findings.append(h)
+
+    # 主路径:OCR + 预处理 + 多路径正则
+    if not ocr_disabled():
+        raw_text = get_ocr_text(data)
+        if raw_text:
+            processed = _preprocess_ocr_text(raw_text)
+            _merge(_collect_findings_multipath(
+                processed, record_id, table_name, field_col_name,
+                db_type, db_name,
+            ))
+            # 原始 OCR 文本(未预处理)也扫一次,防止预处理改错了格式
+            if processed != raw_text:
+                _merge(_collect_findings_multipath(
+                    raw_text, record_id, table_name, field_col_name,
+                    db_type, db_name,
+                ))
+
+    # [新增] 字节级文本兜底:BLOB 里可能混有明文字段(JSON/CSV/裸中文)
+    # 无论 OCR 是否成功,都跑一次字节级 utf-8/gbk 解码扫描,命中会并入结果。
+    byte_text = _bytes_as_text_fallback(data)
+    if byte_text:
+        _merge(_collect_findings_multipath(
+            byte_text, record_id, table_name, field_col_name,
+            db_type, db_name,
+        ))
+
+    return findings
 
 # 别名: 兼容旧版本代码中的调用习惯
 scan_blob_field = scan_blob_data

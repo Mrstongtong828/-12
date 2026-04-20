@@ -22,7 +22,9 @@ import atexit
 
 PER_IMAGE_TIMEOUT_SEC = 25      # 单图稳态推理超时
 SPAWN_TIMEOUT_SEC = 60          # 首次/重建引擎的加载超时(三模型 ~30s)
-MAX_CONSEC_FAIL = 5             # 连续失败熔断阈值(从 2 上调到 5,容忍偶发)
+MAX_CONSEC_FAIL = 8             # 连续失败重启阈值(达到会杀掉子进程并降级休眠)
+MAX_RESTART_CYCLES = 3          # 整个扫描周期内允许的最大"硬熔断轮次"
+RESTART_COOLDOWN_SEC = 3        # 每次重启前冷却,避免狂 spawn
 WORKER_MODULE = "scanners.ocr_worker"
 
 
@@ -32,6 +34,7 @@ class _OCRClient:
         self._lock = threading.Lock()
         self._consec_fail = 0
         self._disabled = False
+        self._restart_cycles = 0
         # 新 worker 第一次调用需要长超时(加载模型),此后回到稳态超时
         self._just_spawned = False
 
@@ -139,14 +142,28 @@ class _OCRClient:
         if text is None:
             self._consec_fail += 1
             if self._consec_fail >= MAX_CONSEC_FAIL:
-                print(
-                    f"[OCR] 连续失败 {self._consec_fail} 次,"
-                    f"本轮禁用 OCR(剩余图片按 0 命中处理)",
-                    flush=True,
-                )
-                self._disabled = True
+                # [v4 改动] 不再一次失败就永久禁用 —— 给 OCR 一次重生机会。
+                # 直到 MAX_RESTART_CYCLES 轮重启都失败,才硬关闭。
                 with self._lock:
                     self._kill_locked()
+                self._restart_cycles += 1
+                if self._restart_cycles >= MAX_RESTART_CYCLES:
+                    print(
+                        f"[OCR] 累计 {self._restart_cycles} 轮硬熔断,"
+                        f"永久禁用 OCR(剩余图片按 0 命中处理)",
+                        flush=True,
+                    )
+                    self._disabled = True
+                else:
+                    print(
+                        f"[OCR] 连续失败 {self._consec_fail} 次,"
+                        f"第 {self._restart_cycles} 轮重启中,冷却 {RESTART_COOLDOWN_SEC}s...",
+                        flush=True,
+                    )
+                    import time as _t
+                    _t.sleep(RESTART_COOLDOWN_SEC)
+                    # 重置计数,允许新一轮 spawn
+                    self._consec_fail = 0
         else:
             self._consec_fail = 0
 

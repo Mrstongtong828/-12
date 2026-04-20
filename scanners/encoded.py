@@ -152,7 +152,8 @@ def _try_unicode_unescape(s: str):
         return None
 
 
-def decode_recursive(value_str: str, max_rounds: int = MAX_DECODE_DEPTH):
+def decode_recursive(value_str: str, max_rounds: int = MAX_DECODE_DEPTH,
+                     collect_intermediate: bool = False):
     """
     递归解码链,带四重防御:
       闸1: 深度上限 max_rounds 轮
@@ -160,9 +161,13 @@ def decode_recursive(value_str: str, max_rounds: int = MAX_DECODE_DEPTH):
       闸3: 循环自指(本轮解码结果已出现在 seen 里)→ 截停
       闸4: 末值 / 初值 > MAX_CUMULATIVE_RATIO → 截停
     任一闸触发都静默返回当前最后合法结果 + 已完成的 chain,不抛异常。
+
+    collect_intermediate=True 时额外返回 intermediates 列表(每轮成功解码后的中间值),
+    用于扫描链式编码中"中间层明文被末轮编码再次遮蔽"的情况(ADDRESS/BANK_CARD 常见)。
     """
     current = value_str
     chain = []
+    intermediates = []
     seen = {current}
     initial_len = max(1, len(value_str))
 
@@ -180,23 +185,32 @@ def decode_recursive(value_str: str, max_rounds: int = MAX_DECODE_DEPTH):
 
             # 闸 2: 单步长度
             if len(result) > MAX_DECODED_LEN:
+                if collect_intermediate:
+                    return current, chain, intermediates
                 return current, chain
             # 闸 3: 循环自指
             if result in seen:
+                if collect_intermediate:
+                    return current, chain, intermediates
                 return current, chain
             # 闸 4: 累计膨胀比
             if len(result) / initial_len > MAX_CUMULATIVE_RATIO:
+                if collect_intermediate:
+                    return current, chain, intermediates
                 return current, chain
 
             chain.append(label)
             current = result
             seen.add(current)
+            intermediates.append(current)
             changed = True
             break
 
         if not changed:
             break
 
+    if collect_intermediate:
+        return current, chain, intermediates
     return current, chain
 
 
@@ -349,13 +363,33 @@ def scan_encoded_field(field_name, raw_value, record_id, table_name,
         if not _is_encoded_value(raw_value):
             return []
 
-    decoded, chain = decode_recursive(raw_value)
+    # [关键优化] 收集解码链所有中间层 —— 链式编码场景中,真正的敏感明文
+    # 可能出现在中间某一层,终值反而是被再次编码的无效串。扫描所有中间
+    # 结果可以显著提升 ADDRESS / BANK_CARD 的 encoded 召回。
+    decoded, chain, intermediates = decode_recursive(raw_value, collect_intermediate=True)
     if not chain or decoded == raw_value:
-        # 解码失败。
-        # - 启发式路径(非强字段):本来就不该有命中,直接返空
-        # - 强字段路径:value 可能是明文 key:value(如 "BANK:xxx|PHONE:yyy"),
-        #   dispatcher 的 5a 会兜底走 structured + data_form=encoded,这里返空
-        #   不冲突(dispatcher 见 hits 为空会继续到 5a)
         return []
 
-    return _scan_decoded(decoded, record_id, table_name, field_col_name, db_type, db_name)
+    findings = []
+    seen_keys = set()
+
+    def _merge(sub_findings):
+        for f in sub_findings:
+            key = (f["sensitive_type"], f["extracted_value"])
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            findings.append(f)
+
+    # 末值扫描(原逻辑)
+    _merge(_scan_decoded(decoded, record_id, table_name, field_col_name, db_type, db_name))
+
+    # 中间层兜底扫描 —— 对每一个成功解码的中间结果跑一次敏感抽取
+    # 只跑"有价值特征"的中间层,避免无意义的二进制噪声串浪费算力
+    for inter in intermediates[:-1]:  # 末层已扫过,跳过
+        if not inter or inter == decoded:
+            continue
+        if _decoded_looks_sensitive(inter):
+            _merge(_scan_decoded(inter, record_id, table_name, field_col_name, db_type, db_name))
+
+    return findings

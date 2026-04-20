@@ -8,4 +8,4 @@ opencv-python==4.6.0.66
 Pillow==10.3.0
 numpy==1.24.3
 # requirements.txt 相关新增项
-pymupdf>=1.25.5,<1.26.0（还未决定要不要用）
+

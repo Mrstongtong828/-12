@@ -596,7 +596,15 @@ def extract_sensitive_from_value(value_str: str) -> list:
         if validate_luhn(val):
             _add("BANK_CARD", val)
             continue
+        # OCR/编码场景宽松放行:
+        #   - 15-19 位长度
+        #   - 首位 3-9(MasterCard/Visa/银联/Discover 等主要卡组织区间)
+        #   - 18 位但同时 validate_id_card 成功的已在 ID_CARD 分支吃掉,
+        #     这里若 Luhn 失败也不再吞
         if len(val) in (15, 16, 17, 18, 19) and val[0] in "356789":
+            # 18 位且能通过身份证校验 → 跳过(身份证优先)
+            if len(val) == 18 and validate_id_card(val):
+                continue
             _add("BANK_CARD", val)
 
     for stype, val in _extract_password_candidates(value_str):
