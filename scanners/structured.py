@@ -5,14 +5,14 @@ from core.config import SENSITIVE_LEVEL_MAP, LEAF_TEXT_MAX_LEN
 from core.patterns import (
     extract_sensitive_from_value, match_field_name,
     extract_by_field_hint,
-    is_valid_address,              
-    is_name_fp_field,              # [FP-fix P0-A]
-    is_job_title_name,             # [Fix #1] 2-4字名路径过滤职务称谓
-    COMPOUND_SURNAMES,             # [Fix #1] 2-4字名路径检测复姓锚点
+    is_valid_address,
+    is_name_fp_field,
+    is_job_title_name,
+    COMPOUND_SURNAMES,
     _SURNAMES_SET, NAME_BLACKLIST, _FIELD_NAME_COMPILED, _NAME_BLACKLIST_RE,
+    _NAME_ADDR_CHARS,
 )
 
-# 提升到模块级,避免 _walk 递归时每次 lazy import
 try:
     from scanners.encoded import _is_encoded_value as _enc_check, decode_recursive as _dec_recursive
 except ImportError:
@@ -55,16 +55,55 @@ def _detect_form(value_str: str) -> str:
     return "structured"
 
 
+def _try_match_short_name(value: str, effective_field: str):
+    """
+    JSON/XML 叶子 2-4 字纯中文值短名兜底。
+    救 try_name_at 不处理的 2 字名(石香/谈凯/向侃 等)。
+    """
+    v = value.strip() if isinstance(value, str) else ""
+    if not (2 <= len(v) <= 4):
+        return None
+    if not all('\u4e00' <= c <= '\u9fa5' for c in v):
+        return None
+    if _NAME_BLACKLIST_RE.search(v):
+        return None
+    if any(c in _NAME_ADDR_CHARS for c in v):
+        return None
+    if is_job_title_name(v):
+        return None
+    
+    # 【修复 3】复姓安全校验，防止数组越界和漏判
+    has_anchor = (v[0] in _SURNAMES_SET) or (len(v) >= 2 and v[:2] in COMPOUND_SURNAMES)
+    if not has_anchor:
+        return None
+        
+    hints = match_field_name(effective_field)
+    if "CHINESE_NAME" not in hints:
+        return None
+        
+    return v
+
+
 def scan_json_value(json_str, record_id, table_name, field_col_name, db_type, db_name):
     findings = []
+    # 【修复 2】引入局部去重器，防止同一JSON内相同的敏感词多次被重复写入
+    seen = set()
+    
     try:
         data = json.loads(json_str)
     except Exception:
         return findings
 
+    def _add(stype, val):
+        key = (stype, val)
+        if key not in seen:
+            seen.add(key)
+            findings.append(_make_finding(
+                db_type, db_name, table_name, field_col_name,
+                record_id, "semi_structured", stype, val
+            ))
+
     def _walk(obj, parent_key=None):
-        # [FP-fix P0-A] 使用最近的父键作为有效字段名。
-        # 这样 ext_json 内部的 {"handler": "张警官"} 也能命中字段黑名单。
         effective_field = parent_key if parent_key else field_col_name
 
         if isinstance(obj, str):
@@ -73,33 +112,30 @@ def scan_json_value(json_str, record_id, table_name, field_col_name, db_type, db
                 decoded, chain = _dec_recursive(obj)
                 if chain:
                     actual = decoded
-            # [性能 #12] JSON 叶子过长时截断
             if len(actual) > LEAF_TEXT_MAX_LEN:
                 actual = actual[:LEAF_TEXT_MAX_LEN]
+                
             for stype, val in extract_sensitive_from_value(actual):
                 if stype == "CHINESE_NAME" and is_name_fp_field(effective_field):
                     continue
-                findings.append(_make_finding(
-                    db_type, db_name, table_name, field_col_name,
-                    record_id, "semi_structured", stype, val,
-                ))
+                _add(stype, val)
+                
+            # 短名兜底
+            short = _try_match_short_name(actual, effective_field)
+            if short:
+                _add("CHINESE_NAME", short)
+                
         elif isinstance(obj, (int, float)):
-            # [B1] JSON 数字类型(如 {"phone": 13800138000})也需扫描
             s = str(int(obj)) if isinstance(obj, float) and obj == int(obj) else str(obj)
             for stype, val in extract_sensitive_from_value(s):
                 if stype == "CHINESE_NAME" and is_name_fp_field(effective_field):
                     continue
-                findings.append(_make_finding(
-                    db_type, db_name, table_name, field_col_name,
-                    record_id, "semi_structured", stype, val,
-                ))
+                _add(stype, val)
+                
         elif isinstance(obj, dict):
             for k, v in obj.items():
                 if isinstance(v, str) and _is_password_field(k):
-                    findings.append(_make_finding(
-                        db_type, db_name, table_name, field_col_name,
-                        record_id, "semi_structured", "PASSWORD_OR_SECRET", v,
-                    ))
+                    _add("PASSWORD_OR_SECRET", v)
                 else:
                     _walk(v, parent_key=k)
         elif isinstance(obj, list):
@@ -112,29 +148,42 @@ def scan_json_value(json_str, record_id, table_name, field_col_name, db_type, db
 
 def scan_xml_value(xml_str, record_id, table_name, field_col_name, db_type, db_name):
     findings = []
+    # 【修复 2】同理，XML也需要局部去重器
+    seen = set()
+    
     try:
         root = ET.fromstring(xml_str)
     except Exception:
         return findings
 
+    def _add(stype, val):
+        key = (stype, val)
+        if key not in seen:
+            seen.add(key)
+            findings.append(_make_finding(
+                db_type, db_name, table_name, field_col_name,
+                record_id, "semi_structured", stype, val
+            ))
+
     def _walk_elem(elem):
         tag_name = elem.tag if elem.tag else field_col_name
         if elem.text and elem.text.strip():
-            for stype, val in extract_sensitive_from_value(elem.text.strip()):
+            text = elem.text.strip()
+            for stype, val in extract_sensitive_from_value(text):
                 if stype == "CHINESE_NAME" and is_name_fp_field(tag_name):
                     continue
-                findings.append(_make_finding(
-                    db_type, db_name, table_name, field_col_name,
-                    record_id, "semi_structured", stype, val,
-                ))
+                _add(stype, val)
+                
+            short = _try_match_short_name(text, tag_name)
+            if short:
+                _add("CHINESE_NAME", short)
+                
         for attr_name, attr_val in elem.attrib.items():
             for stype, val in extract_sensitive_from_value(attr_val):
                 if stype == "CHINESE_NAME" and is_name_fp_field(attr_name):
                     continue
-                findings.append(_make_finding(
-                    db_type, db_name, table_name, field_col_name,
-                    record_id, "semi_structured", stype, val,
-                ))
+                _add(stype, val)
+                
         for child in elem:
             _walk_elem(child)
 
@@ -146,7 +195,7 @@ def _regex_fallback_scan(value_str, field_name, record_id, table_name,
                         field_col_name, db_type, db_name, data_form):
     findings = []
     field_hints = None
-    emitted_names = set()  # [Fix #1] 跟踪已 emit 的 CHINESE_NAME,避免短名兜底重复
+    emitted_names = set()
 
     for stype, val in extract_sensitive_from_value(value_str):
         if stype == "CHINESE_NAME":
@@ -155,29 +204,21 @@ def _regex_fallback_scan(value_str, field_name, record_id, table_name,
             if field_hints is None:
                 field_hints = match_field_name(field_name)
             if "CHINESE_NAME" not in field_hints:
-                if not (len(val) >= 2
-                        and val[0] in _SURNAMES_SET
-                        and not _NAME_BLACKLIST_RE.search(val)):
+                # 【修复 3】加上了对复姓的支持，防止漏杀
+                has_anchor = (val[0] in _SURNAMES_SET) or (len(val) >= 2 and val[:2] in COMPOUND_SURNAMES)
+                if not (len(val) >= 2 and has_anchor and not _NAME_BLACKLIST_RE.search(val)):
                     continue
             emitted_names.add(val)
-        elif stype == "ADDRESS":
-            if not is_valid_address(val, strict=True):
-                continue
+            
+        # 【修复 1】彻底删除了此处自作主张的 ADDRESS strict 过滤拦截！
+        # 让 extract_sensitive_from_value 内部的智能判断说了算，不再做二次截杀。
 
         findings.append(_make_finding(
             db_type, db_name, table_name, field_col_name,
             record_id, data_form, stype, val,
         ))
 
-    # ── [Fix #1] 结构化字段名强匹配 CHINESE_NAME,且整值是 2-4 字纯中文时,
-    # 走宽松路径:首字是姓氏(或复姓 bigram)+ 非黑名单 + 非职务后缀 → 直接接受。
-    # 主要救:
-    #   1. 2 字名(如 居晸/曾榜/魏晴,try_name_at 根本不尝试 2 字)
-    #   2. 复姓中含"乡"等地址字的名字(如 东乡霜,被 _NAME_ADDR_CHARS 误拒)
-    # 安全约束:
-    #   - 只在 structured 形态跑,不污染 unstructured_text 的自然语言扫描
-    #   - 字段名必须已命中 CHINESE_NAME 白名单(real_name/consignee/holder_name 等),
-    #     上下文极强,不放开姓氏外的字形检测也是安全的
+    # Structured纯文本短名（如张三）最后兜底防漏
     if (data_form == "structured"
             and 2 <= len(value_str) <= 4
             and value_str not in emitted_names
@@ -185,6 +226,7 @@ def _regex_fallback_scan(value_str, field_name, record_id, table_name,
             and all('\u4e00' <= c <= '\u9fa5' for c in value_str)
             and not _NAME_BLACKLIST_RE.search(value_str)
             and not is_job_title_name(value_str)):
+            
         if field_hints is None:
             field_hints = match_field_name(field_name)
         if "CHINESE_NAME" in field_hints:
@@ -205,6 +247,7 @@ def _regex_fallback_scan(value_str, field_name, record_id, table_name,
         ))
 
     return findings
+
 
 def scan_structured_field(field_name, value, record_id, table_name,
                            field_col_name, db_type, db_name):
