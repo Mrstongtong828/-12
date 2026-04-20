@@ -2,7 +2,6 @@ import re
 from core.config import MAX_SCAN_LEN
 
 COMMON_SURNAMES = [
-    # 百家姓常见单字姓
     "李", "王", "张", "刘", "陈", "杨", "赵", "黄", "周", "吴",
     "徐", "孙", "胡", "朱", "高", "林", "何", "郭", "马", "罗",
     "梁", "宋", "郑", "谢", "韩", "唐", "冯", "于", "董", "萧",
@@ -13,7 +12,6 @@ COMMON_SURNAMES = [
     "郝", "孔", "白", "崔", "康", "毛", "邱", "秦", "江", "史",
     "顾", "侯", "邵", "孟", "龙", "万", "段", "钱", "汤", "窦",
     "尹", "黎", "易", "常", "武", "乔", "贺", "赖", "龚", "文",
-    # example.csv 中出现的额外姓氏（单字）
     "公", "吉", "乐", "鄂", "家", "伶", "贡", "苍", "晏", "华",
     "郁", "桂", "崎", "禄", "阚", "羿", "汲", "信", "边", "仲",
     "共", "暨", "巢", "翟", "蔚", "步", "厉", "空", "隗", "牧",
@@ -22,50 +20,72 @@ COMMON_SURNAMES = [
     "赫", "霍", "欧", "游", "苗", "古", "储", "聂", "阮", "莫",
     "帅", "焦", "巴", "干", "甘", "连", "解", "屈", "晁", "柴",
     "冷", "汝", "兰", "温", "司", "包", "蒲", "居",
-    # example.csv 漏报姓氏补充
     "陶", "蒙", "郜", "湛", "宁", "伏", "谈", "沃", "雷", "胥", "尚",
-    # ── v3 新增:diff_report 里漏报的姓氏/冷僻字 ──────────────
     "鄂", "漕", "籍", "屏",
-    # "公"已经在了但会拉 FP,保留但在 NAME_BLACKLIST 里加 "公学义"等误报
 ]
 
-# 模块级预编译，避免热路径重建（fix P1）
 _SURNAMES_SET = frozenset(COMMON_SURNAMES)
 
-# 复姓（双字姓）列表，用于辅助识别4字名
 COMPOUND_SURNAMES = {
     "仲孙", "公冶", "公良", "公羊", "公孙", "令狐", "共叔", "即墨",
     "东方", "东乡", "西门", "南宫", "北宫", "上官", "夏侯", "诸葛",
     "司马", "司徒", "司空", "欧阳", "左丘", "太史", "端木", "轩辕",
     "皇甫", "呼延", "慕容", "宇文", "长孙", "尉迟", "独孤", "拓跋",
     "元亓", "同蹄", "伶舟", "公叔", "乐正", "万俟", "赫连",
-    # example.csv 反推新增
-    "公甲", "公荆", "公冉",# diff_report 里漏的:
-    
+    "公甲", "公荆", "公冉",
 }
 
 NAME_BLACKLIST = {
     "系统", "管理员", "用户", "客户", "测试", "操作员", "访客", "匿名",
     "超级", "普通", "默认", "临时", "公司", "企业", "机构", "部门",
     "服务", "平台", "应用", "接口", "数据", "信息", "记录", "账号",
-    # ── v3 新增:OCR 噪声和文本切片误报的伪名 ──────────────
     "家属", "签字", "总金额", "金额", "合计", "日期",
     "公金", "公学", "同总", "方签", "公朱",
     "承福", "总金", "金承",
+
+    "万元整", "任何一方", "同协议书",
+    "向对方支", "方按照本", "方收款账", "方权责如",
+    "方收款", "方权责", "协议书",
+    "元元微", "元元微澜",
+    "梁台子",
+
+    "蒙脱石", "蒙脱石散", "方左氧", "方阿莫",
+    "方布洛", "莫西林", "莫西林胶",
+    "常密度", "常密度影", "明显异", "明显异常",
+    "方记", "苗氯雷", "苗氯雷他",
+
+    "谢谢", "感谢", "多谢", "您好", "抱歉",
+    "方式", "方案", "方面", "方向",
+    "方账户", "方账",
+    "家欺", "周协助", "高新技", "高新技术",
+    "金山经", "武清汽",
+
+    "家地址", "家地址内", "家庭地", "家庭月", "家转账", "家收款",
+    "家长证", "家长证件",
+    "籍地址", "籍迁移", "户籍地",
+    "公民身", "民身份", "公民", "公众",
+    "居民纠", "居民纠纷", "信访件", "信人殷", "信人",
+    "信都高", "信都高驰",
+    "东经济", "经济开",
+    "蒙古武", "蒙古自", "蒙古包",
+
+    "于验证", "于标准", "于核实",
+    "即止付", "向账户", "向对方",
+
+    "王四营",
+
+    "方当事", "方当事人", "公输翰", "公输翰翮", "公输鹰", "公旅琛",
+    "共叔傲", "共叔傲云",
 }
 
-# [P4] 预编译黑名单正则，替换 O(n) 子串循环
 _NAME_BLACKLIST_RE = re.compile("|".join(re.escape(w) for w in NAME_BLACKLIST))
 
-# 地址/机构常见字：出现任一即认为这段 2-4 字串不是人名（防止从地址文本里误切名字）
-# 例：'家庄市石' / '东门街道' / '宁市西乡' / '家乡1347' / '宁夏回族' 等
 _NAME_ADDR_CHARS = frozenset(
     "省市区县乡镇村街道路弄巷号栋楼室组院庄园区苑里"
     "局院厅局部处司委办站场库所馆组"
-    "族"  # 宁夏回族/汉族 之类，属于民族区划而非人名内部字
+    "族"
 )
 
-# ── [FP-fix P0-A] 字段名黑名单 ─────────────────────────────────────
 NAME_FP_FIELD_BLACKLIST = frozenset({
     "handler", "operator", "created_by", "updated_by", "modified_by",
     "service_type", "role_name", "role", "user_role",
@@ -75,92 +95,91 @@ NAME_FP_FIELD_BLACKLIST = frozenset({
 
 
 def is_name_fp_field(field_name: str) -> bool:
-    """字段名是否在"人名占位符"黑名单里。"""
     if not field_name:
         return False
     return field_name.lower() in NAME_FP_FIELD_BLACKLIST
 
 
-# ── [FP-fix P0-B] 职务/称谓后缀黑名单 ─────────────────────────────
 NAME_JOB_SUFFIXES = (
-    # 警务/司法
     "警官", "警察", "干警", "法官", "检察官", "所长",
-    # 行政
     "审计员", "专员", "经理", "主任", "科长", "处长", "部长",
     "院长", "厅长", "局长", "书记", "干部", "员工", "师傅",
-    # 医疗/教育
     "医生", "护士", "大夫", "老师", "教授", "博士", "研究员",
-    # 称谓
     "先生", "女士", "同志",
 )
 
 
 def is_job_title_name(name: str) -> bool:
-    """名字是否以职务/称谓后缀结尾。"""
     if not name:
         return False
     return any(name.endswith(suf) for suf in NAME_JOB_SUFFIXES)
 
 
-# ── [FP-fix P0-D] 动词 / 病理 / 分词切片 字符黑名单 ─────────────
 _NAME_VERB_CHARS = frozenset(
-    # 虚词：几乎不会作人名内部字
     "的了是在有和与及或但也把被让使"
-    # 病理术语
     "炎症瘤癌疾患肿疼痛"
-    # 器官（真人名里罕见）
     "肝肺脾胃肾脑胰"
-    # 高频 FP 触发字（公积金"提" / 高血"压" / 家庭"住" / 刘"跟"进）
     "压住提取申办跟"
-    # 分词遗留常见虚字
     "及等均各某"
 )
 
 
 def _is_verbish_name(name: str) -> bool:
-    """
-    名字从第 2 字起含动词 / 病理 / 虚词 字 → 判为 FP。
-    首字是姓氏（单独做姓氏白名单校验），所以只扫 name[1:]。
-    """
     if len(name) < 2:
         return False
     return any(c in _NAME_VERB_CHARS for c in name[1:])
 
 
-# ── [Fix #1] 中文名 4 字末尾溢出检测 ─────────────────────────────
-_NAME_TAIL_SPILLOVER = frozenset("先同女老生的了吗是就都会把说想要到这那之为与和及反")
+_NAME_TAIL_SPILLOVER = frozenset(
+    "先同女老生的了吗是就都会把说想要到这那之为与和及反"
+    "询账如支"
+)
+
 _NAME_TRAIL_JOB_HEADS = frozenset([
     "先生", "女士", "同志", "老师", "医生", "大夫", "警官", "先后",
 ])
 
 _NAME_FOLLOW_VERB_BIGRAMS = frozenset([
-    # 原有
     "反映", "反馈", "继续", "处理", "办理", "审查", "审核", "提交",
     "通知", "更新", "提供", "咨询", "投诉", "举报", "跟进", "欺诈",
     "告知", "询问", "拒绝", "承认", "表示", "答复", "回复", "上报",
     "解决", "配合", "确认", "申请", "申报", "退款", "退货",
-    # 扩容
     "来电", "来访", "来店", "来人", "来信",
     "报案", "报名", "报到", "报警", "报修",
     "到场", "到访", "到店",
     "取消", "取件", "取货",
     "送达", "送到",
     "入院", "入住", "入职",
-    "出院", "出差", "出院",
+    "出院", "出差",
     "离职", "离店",
     "前往", "前来",
     "希望", "要求", "请求",
     "同意", "不同",
+
+    "身份", "身边", "身体", "身心",
+    "证件", "证明", "证号", "证实", "证据",
+    "民身", "民警", "民事", "民政",
+    "止付", "付款", "付清", "付讫", "付给",
+    "转账", "转入", "转出", "转给", "转到", "转回",
+    "扣款", "扣费", "扣除",
+    "退还",
+    "核实", "核查", "核对", "核准", "核销",
+    "验证", "验收", "验明",
+    "登记", "登陆", "登录",
+    "变更", "更改", "撤销",
+    "家住", "家在", "家庭",
+    "居住", "居民", "居所",
+    "协助", "协议", "协调",
+    "诉求", "控诉",
+    "账户", "账号", "账单",
 ])
 
 
 def _contains_verb_bigram(s: str) -> bool:
-    """候选里是否包含动词短语 2 字组（反映/继续/欺诈 ...）。"""
     return any(s[k:k+2] in _NAME_FOLLOW_VERB_BIGRAMS for k in range(len(s) - 1))
 
 
 def _is_valid_name_shape(cand: str) -> bool:
-    """公共过滤链：黑名单/地址字/职务后缀/动词字/动词短语。"""
     if _NAME_BLACKLIST_RE.search(cand):
         return False
     if any(c in _NAME_ADDR_CHARS for c in cand):
@@ -175,20 +194,16 @@ def _is_valid_name_shape(cand: str) -> bool:
 
 
 def try_name_at(text: str, i: int):
-    """
-    以 text[i] 作为姓氏锚点尝试抽出一个名字候选。
-    返回 (name, consumed_len) 或 (None, 0)。
-    优先级 4 字 → 3 字（带末尾溢出保护），都失败返回 None。
-    不处理 2 字名（需触发词上下文，由调用方独立处理）。
-    """
     n = len(text)
-    # 姓氏锚点校验
     is_compound = (i + 2 <= n and text[i:i+2] in COMPOUND_SURNAMES)
     is_single = text[i] in _SURNAMES_SET
     if not (is_compound or is_single):
         return None, 0
 
-    for L in (4, 3):
+    # 【核心修复 1】掐断超长伪名：复姓允许 4/3/2 字，单字姓强制只能 3/2 字
+    lengths = (4, 3, 2) if is_compound else (3, 2)
+
+    for L in lengths:
         if i + L > n:
             continue
         cand = text[i:i+L]
@@ -196,15 +211,15 @@ def try_name_at(text: str, i: int):
             continue
         if _contains_verb_bigram(cand):
             continue
-        # [Fix-3字吞字] 3 字候选末字 + 下一字构成动词 bigram → 候选把动词首字吞了
         if L == 3 and i + L < n:
             spill_bigram = cand[-1] + text[i + L]
             if spill_bigram in _NAME_FOLLOW_VERB_BIGRAMS:
                 continue
-        # 4 字末尾溢出保护
         if L == 4:
             next_char = text[i+L] if i+L < n else ''
             if cand[-1] + next_char in _NAME_TRAIL_JOB_HEADS:
+                continue
+            if cand[-1] + next_char in _NAME_FOLLOW_VERB_BIGRAMS:
                 continue
             if cand[-1] in _NAME_TAIL_SPILLOVER:
                 continue
@@ -220,11 +235,8 @@ FIELD_NAME_DICT = {
     "CHINESE_NAME": [
         r"\breal_name\b", r"\btrue_name\b", r"\bcustomer_name\b", r"\buser_name\b",
         r"\bfull_name\b", r"\bperson_name\b", r"\bclient_name\b", r"\bowner_name\b",
-        r"\bcontact_name\b", r"\bapplicant_name\b",
-        r"\bconsignee\b",                                   # [新增] 收货人
-        r"\bholder_name\b", r"\bpatient_name\b",            # [新增] 持有人 / 患者
-        r"\bxingming\b", r"\bxm\b",
-        r"\bname\b",
+        r"\bcontact_name\b", r"\bapplicant_name\b", r"\bconsignee\b",
+        r"\bholder_name\b", r"\bpatient_name\b", r"\bxingming\b", r"\bxm\b", r"\bname\b",
     ],
     "PHONE_NUMBER": [
         r"\bphone\b", r"\bmobile\b", r"\btel\b", r"\bcellphone\b",
@@ -237,13 +249,12 @@ FIELD_NAME_DICT = {
     ],
     "ADDRESS": [
         r"\baddress\b", r"\bhome_address\b", r"\bresidence\b", r"\blocation\b",
-        r"\baddr\b", r"\bstreet\b", r"\bdizhi\b",
-        r"\bfull_address\b",                                # [新增]
+        r"\baddr\b", r"\bstreet\b", r"\bdizhi\b", r"\bfull_address\b",
+        r"\bdomicile\b", r"\bhukou\b", r"\bhuji\b",
     ],
     "ID_CARD": [
         r"\bid_card\b", r"\bid_no\b", r"\bidentity_card\b", r"\bidcard\b",
-        r"\bid_number\b", r"\bsfz\b", r"\bshenfenzheng\b", r"\bnational_id\b",
-        r"\bid_verify\b",                                   # [新增] example 有 id_verify 字段
+        r"\bid_number\b", r"\bsfz\b", r"\bshenfenzheng\b", r"\bnational_id\b", r"\bid_verify\b",
     ],
     "BANK_CARD": [
         r"\bbank_card\b", r"\bcard_no\b", r"\bbank_account\b", r"\baccount_no\b",
@@ -278,22 +289,19 @@ FIELD_NAME_DICT = {
         r"\bshehui_xinyong\b",
     ],
     "BUSINESS_LICENSE_NO": [
-        r"\bbusiness_license\b", r"\blicense_no\b", r"\byingye_zhizhao\b",
-        r"\bregistration_no\b",
+        r"\bbusiness_license\b", r"\blicense_no\b", r"\byingye_zhizhao\b", r"\bregistration_no\b",
     ],
     "SOCIAL_SECURITY_NO": [
         r"\bsocial_security\b", r"\bss_no\b", r"\bshebao\b", r"\binsurance_no\b",
     ],
     "HOUSING_FUND_NO": [
-        r"\bhousing_fund\b", r"\bgongjijin\b", r"\bprovident_fund\b",
-        r"\bhf_no\b",                                       # [新增] example 有 hf_no 字段
+        r"\bhousing_fund\b", r"\bgongjijin\b", r"\bprovident_fund\b", r"\bhf_no\b",
     ],
     "MEDICAL_INSURANCE_NO": [
         r"\bmedical_insurance\b", r"\byibao\b", r"\bhealth_insurance\b",
     ],
     "MEDICAL_RECORD_NO": [
-        r"\bmedical_record\b", r"\bpatient_id\b", r"\bcase_no\b", r"\bbingli\b",
-        r"\bmedical_record_no\b",                           # [新增] 显式覆盖
+        r"\bmedical_record\b", r"\bpatient_id\b", r"\bcase_no\b", r"\bbingli\b", r"\bmedical_record_no\b",
     ],
     "PASSWORD_OR_SECRET": [
         r"\bpassword\b", r"\bpasswd\b", r"\bpwd\b", r"\bsecret\b",
@@ -309,61 +317,24 @@ _FIELD_NAME_COMPILED = {
 }
 
 REGEX_PATTERNS = {
-    "PHONE_NUMBER": re.compile(
-        r"(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)"
-    ),
-    "EMAIL": re.compile(
-        r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"
-    ),
-    "ID_CARD": re.compile(
-        r"(?<!\d)[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?!\d)"
-    ),
-    "BANK_CARD": re.compile(
-        r"(?<!\d)[3-9]\d{14,18}(?!\d)"
-    ),
-    "PASSPORT": re.compile(
-        r"(?<![A-Z0-9])[EGDPS]\d{8}(?![A-Z0-9])"
-    ),
-    "MILITARY_ID": re.compile(
-        r"[\u4e00-\u9fa5]{1,2}字第\s*\d{4,8}\s*号"
-    ),
-    "IP_ADDRESS": re.compile(
-        r"(?<!\d)(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)(?!\d)"
-    ),
-    "MAC_ADDRESS": re.compile(
-        r"(?:[0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}"
-    ),
-    "GPS_COORDINATE": re.compile(
-        r"-?\d{1,3}\.\d{4,},\s*-?\d{1,3}\.\d{4,}"
-    ),
-    "LICENSE_PLATE": re.compile(
-        r"[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤川青藏琼宁夏]"
-        r"[A-Z][·•]?[A-Z0-9]{4,6}(?!\d)"
-    ),
-    "VIN_CODE": re.compile(
-        r"(?<![A-HJ-NPR-Z0-9])(?=.*[A-HJ-NPR-Z])[A-HJ-NPR-Z0-9]{17}(?![A-HJ-NPR-Z0-9])"
-    ),
-    "USCC": re.compile(
-        r"(?<![A-Z0-9])[0-9A-NP-Y][0-9A-Z]\d{6}[0-9A-Z]{9}[0-9A-Z](?![A-Z0-9])"
-    ),
-    "BUSINESS_LICENSE_NO": re.compile(
-        r"(?<!\d)[1-9]\d{14}(?!\d)"
-    ),
-    "SOCIAL_SECURITY_NO": re.compile(
-        r"[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤川青藏琼宁夏][A-Z]{2}\d{8}"
-    ),
-    "HOUSING_FUND_NO": re.compile(
-        r"(?<![A-Z])[A-Z]{2}20[12]\d{8}(?!\d)"
-    ),
-    "MEDICAL_INSURANCE_NO": re.compile(
-        r"YB\d{14,16}"
-    ),
-    "MEDICAL_RECORD_NO": re.compile(
-        r"MR\d{9}"
-    ),
-    "CHINESE_NAME": re.compile(
-        r"[\u4e00-\u9fa5]{2,4}"
-    ),
+    "PHONE_NUMBER": re.compile(r"(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)"),
+    "EMAIL": re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"),
+    "ID_CARD": re.compile(r"(?<!\d)[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?!\d)"),
+    "BANK_CARD": re.compile(r"(?<!\d)[3-9]\d{14,18}(?!\d)"),
+    "PASSPORT": re.compile(r"(?<![A-Z0-9])[EGDPS]\d{8}(?![A-Z0-9])"),
+    "MILITARY_ID": re.compile(r"[\u4e00-\u9fa5]{1,2}字第\s*\d{4,8}\s*号"),
+    "IP_ADDRESS": re.compile(r"(?<!\d)(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)(?!\d)"),
+    "MAC_ADDRESS": re.compile(r"(?:[0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}"),
+    "GPS_COORDINATE": re.compile(r"-?\d{1,3}\.\d{4,},\s*-?\d{1,3}\.\d{4,}"),
+    "LICENSE_PLATE": re.compile(r"[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤川青藏琼宁夏][A-Z][·•]?[A-Z0-9]{4,6}(?!\d)"),
+    "VIN_CODE": re.compile(r"(?<![A-HJ-NPR-Z0-9])(?=.*[A-HJ-NPR-Z])[A-HJ-NPR-Z0-9]{17}(?![A-HJ-NPR-Z0-9])"),
+    "USCC": re.compile(r"(?<![A-Z0-9])[0-9A-NP-Y][0-9A-Z]\d{6}[0-9A-Z]{9}[0-9A-Z](?![A-Z0-9])"),
+    "BUSINESS_LICENSE_NO": re.compile(r"(?<!\d)[1-9]\d{14}(?!\d)"),
+    "SOCIAL_SECURITY_NO": re.compile(r"[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤川青藏琼宁夏][A-Z]{2}\d{8}"),
+    "HOUSING_FUND_NO": re.compile(r"(?<![A-Z])[A-Z]{2}20[12]\d{8}(?!\d)"),
+    "MEDICAL_INSURANCE_NO": re.compile(r"YB\d{14,16}"),
+    "MEDICAL_RECORD_NO": re.compile(r"MR\d{9}"),
+    "CHINESE_NAME": re.compile(r"[\u4e00-\u9fa5]{2,4}"),
     "ADDRESS": re.compile(
         r"(?:(?:[\u4e00-\u9fa5]{2,4}省|[\u4e00-\u9fa5]{2,5}自治区)\s*)?"
         r"(?:[\u4e00-\u9fa5]{2,6}市\s*)?"
@@ -372,7 +343,9 @@ REGEX_PATTERNS = {
     ),
 }
 
-# ── 密码/密钥专项正则 ──────────────────────────────────────────────
+_PSEUDO_UNICODE_TOKEN = re.compile(r"u([0-9a-fA-F]{4})")
+_PSEUDO_UNICODE_MIN_TOKENS = 5
+
 _BCRYPT_RE = re.compile(r"\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}")
 _SK_KEY_RE = re.compile(r"sk-[A-Za-z0-9]{20,}")
 _AK_KEY_RE = re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{16}")
@@ -381,8 +354,6 @@ _HASH_RE = re.compile(
     r"(?:[a-fA-F0-9]{32}|[a-fA-F0-9]{40}|[a-fA-F0-9]{64})"
     r"(?![a-fA-F0-9])"
 )
-
-# [v3 新增] MD5/SHA hash 必须含至少一个 a-f 字母,否则是纯数字 → 不是 hash
 _HASH_RE_MUST_HAVE_LETTER = re.compile(r"[a-fA-F]")
 
 _PWD_KV_RE = re.compile(
@@ -425,7 +396,11 @@ def validate_uscc(uscc_str: str) -> bool:
     if len(uscc_str) != 18:
         return False
     valid_chars = set("0123456789ABCDEFGHJKLMNPQRTUWXY")
-    return all(c in valid_chars for c in uscc_str)
+    if not all(c in valid_chars for c in uscc_str):
+        return False
+    if not any(c.isalpha() for c in uscc_str):
+        return False
+    return True
 
 
 def validate_business_license(val: str) -> bool:
@@ -465,7 +440,6 @@ def _extract_password_candidates(value_str: str) -> list:
         _add(m.group())
     for m in _HASH_RE.finditer(value_str):
         val = m.group()
-        # 纯数字的 32/40/64 位串不是 hash (OCR 把 BANK_CARD 长数字串误判过来)
         if not _HASH_RE_MUST_HAVE_LETTER.search(val):
             continue
         _add(val)
@@ -478,7 +452,6 @@ def _extract_password_candidates(value_str: str) -> list:
     return results
 
 
-# ── [P0-C] ADDRESS 硬清洗常量 ─────────────────────────────────────
 _ADDR_LABEL_PREFIXES = (
     "家庭住址", "现住址", "联系地址", "通讯地址", "户籍地址", "居住地址",
     "收货地址", "详细地址", "办公地址", "单位地址",
@@ -523,6 +496,8 @@ _ADDR_ADMIN_ANCHOR = re.compile(
 
 _ADDR_ANCHOR_MAX_PREFIX = 8
 
+_ADDR_REGION_ANCHORS = ("省", "市", "自治区", "特别行政区")
+
 
 def clean_address_prefix(addr: str) -> str:
     if not addr:
@@ -549,6 +524,37 @@ def clean_address_prefix(addr: str) -> str:
     if not s or len(s) < 10:
         return original
     return s
+
+
+_ADDR_ADMIN_CHARS = frozenset("省市区县")
+_ADDR_STREET_CHARS = frozenset("路街巷弄号栋楼室")
+
+
+def is_valid_address(val: str, strict: bool = True) -> bool:
+    if not val:
+        return False
+    v = val.strip()
+
+    low = v.lower()
+    for p in _ADDR_LABEL_PREFIXES:
+        if low.startswith(p.lower()):
+            return False
+
+    if any(c in _ADDR_STOP_CHARS for c in v):
+        return False
+
+    tail = v[-6:]
+    if not any(w in tail for w in _ADDR_TAIL_WORDS):
+        return False
+
+    min_len = 15 if strict else 10
+    if len(v) < min_len:
+        return False
+    if not any(c in _ADDR_ADMIN_CHARS for c in v):
+        return False
+    if not any(c in _ADDR_STREET_CHARS for c in v):
+        return False
+    return True
 
 
 def extract_sensitive_from_value(value_str: str) -> list:
@@ -587,13 +593,10 @@ def extract_sensitive_from_value(value_str: str) -> list:
                       for s, e in found_id_card_spans + found_uscc_spans)
         if overlap:
             continue
-        # Luhn 通过 → 直接加
         if validate_luhn(val):
             _add("BANK_CARD", val)
             continue
-        # Luhn 不通过:若长度 16/19 位且首位合法(3-6/8-9 是常见银行卡首位),仍保留
-        # 这样救回 example.csv 里不符合 Luhn 的伪银行卡号
-        if len(val) in (16, 17, 18, 19) and val[0] in "356789":
+        if len(val) in (15, 16, 17, 18, 19) and val[0] in "356789":
             _add("BANK_CARD", val)
 
     for stype, val in _extract_password_candidates(value_str):
@@ -610,7 +613,6 @@ def extract_sensitive_from_value(value_str: str) -> list:
         for m in pattern.finditer(value_str):
             _add(stype, m.group())
 
-    # ── CHINESE_NAME：姓氏锚点扫描 ──────────────────────────────
     i = 0
     vlen = len(value_str)
     while i < vlen:
@@ -625,15 +627,12 @@ def extract_sensitive_from_value(value_str: str) -> list:
                 continue
         i += 1
 
-    # ── ADDRESS：先清洗前缀，再做长度/label 校验 ──────────────────
+    # 【核心修复 2】激活沉睡的盾牌：使用 is_valid_address 进行强制拦截，取代原先简陋的判断
     for m in REGEX_PATTERNS["ADDRESS"].finditer(value_str):
         addr = clean_address_prefix(m.group())
-        if len(addr) < 10:
-            continue
-        low = addr.lower()
-        if any(low.startswith(p.lower()) for p in _ADDR_LABEL_PREFIXES):
-            continue
-        _add("ADDRESS", addr)
+        # 利用底部的形态校验函数做兜底，过滤非地址类的长文本
+        if is_valid_address(addr, strict=False):
+            _add("ADDRESS", addr)
 
     return results
 
@@ -659,35 +658,3 @@ def extract_by_field_hint(field_name: str, value_str: str) -> list:
             hits.append(("BUSINESS_LICENSE_NO", val))
 
     return hits
-
-
-# ── ADDRESS 统一校验 ────────────────────────────────────────────
-_ADDR_ADMIN_CHARS = frozenset("省市区县")
-_ADDR_STREET_CHARS = frozenset("路街巷弄号栋楼室")
-
-
-def is_valid_address(val: str, strict: bool = True) -> bool:
-    if not val:
-        return False
-    v = val.strip()
-
-    low = v.lower()
-    for p in _ADDR_LABEL_PREFIXES:
-        if low.startswith(p.lower()):
-            return False
-
-    if any(c in _ADDR_STOP_CHARS for c in v):
-        return False
-
-    tail = v[-6:]
-    if not any(w in tail for w in _ADDR_TAIL_WORDS):
-        return False
-
-    min_len = 15 if strict else 10
-    if len(v) < min_len:
-        return False
-    if not any(c in _ADDR_ADMIN_CHARS for c in v):
-        return False
-    if not any(c in _ADDR_STREET_CHARS for c in v):
-        return False
-    return True
