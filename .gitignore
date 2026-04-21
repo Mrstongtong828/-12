@@ -13,3 +13,11 @@ docker数据库启动/*.tar.gz
 docker数据库启动/hs_err_*.log
 docker数据库启动/replay_*.log
 output/*.csv
+# 忽略临时测试报告
+diff_report.txt
+
+# 忽略 output 文件夹及其内部所有内容 (例如日志和 debug 图片)
+output/
+
+# 忽略所有的 tar.gz 压缩包文件
+*.tar.gz

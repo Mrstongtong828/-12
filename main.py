@@ -8,8 +8,11 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("FLAGS_eager_delete_tensor_gb", "0")
 os.environ.setdefault("FLAGS_allocator_strategy", "auto_growth")
-# [比赛机 i5-10400/16GB] Paddle 占比封顶 ~4GB
-os.environ.setdefault("FLAGS_fraction_of_cpu_memory_to_use", "0.25")
+# [比赛机 i5-10400/16GB]
+# Why: 2026-04-21 第四轮 ocr_client.py 改为 2-slot 池化,每个 slot 由 _spawn 时的
+# env 硬覆盖为 0.20(两个合计 ~6.4GB,给主进程+OS+Docker 留 ~9.6GB)。
+# 主进程自身不直接调 paddle,此处值仅用于 ocr_client 没显式 override 时的兜底。
+os.environ.setdefault("FLAGS_fraction_of_cpu_memory_to_use", "0.20")
 
 import sys
 import importlib.metadata
@@ -84,40 +87,60 @@ def _estimate_row_count(conn, db_type: str, db_name: str, table_name: str) -> in
     except Exception:
         pass
     return 0
-def _has_blob_column(conn, db_type: str, db_name: str, table_name: str) -> bool:
+def _get_blob_columns(conn, db_type: str, db_name: str, table_name: str) -> list:
     """
-    检测表是否含 BLOB/BYTEA 等二进制列。
-    用途:这类表限制扫描行数,避免 OCR 子进程大量失败时白白烧完 300s 单表预算。
-    查询失败(权限等)默认返 False,走正常流程,不阻塞扫描。
+    返回表的 BLOB/BYTEA 列名列表(空列表 = 非 BLOB 表)。
+    配合 stream_table_rows(where_sql=...) 做 SQL 层 NULL/tiny 过滤,
+    避免把 350s 预算烧在空 placeholder 行上。
     """
     try:
         if db_type == "mysql":
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS "
+                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
                     "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
                     "  AND DATA_TYPE IN "
                     "    ('blob','tinyblob','mediumblob','longblob',"
                     "     'binary','varbinary')",
                     (db_name, table_name),
                 )
-                row = cur.fetchone()
-                if row is None:
-                    return False
-                cnt = row.get("cnt") if isinstance(row, dict) else row[0]
-                return int(cnt or 0) > 0
+                rows = cur.fetchall()
+                return [
+                    (r.get("COLUMN_NAME") if isinstance(r, dict) else r[0])
+                    for r in rows
+                ]
         elif db_type == "postgresql":
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "SELECT column_name FROM information_schema.columns "
                     "WHERE table_name = %s AND data_type = 'bytea'",
                     (table_name,),
                 )
-                row = cur.fetchone()
-                return int(row[0] or 0) > 0 if row else False
+                rows = cur.fetchall()
+                return [r[0] for r in rows]
     except Exception:
         pass
-    return False
+    return []
+
+
+def _has_blob_column(conn, db_type: str, db_name: str, table_name: str) -> bool:
+    """二选判定,只是 _get_blob_columns 的薄包装,保留给既有调用。"""
+    return bool(_get_blob_columns(conn, db_type, db_name, table_name))
+
+
+def _build_blob_where_sql(db_type: str, blob_cols: list, min_bytes: int = 200) -> str:
+    """
+    构造 BLOB 表的 WHERE 过滤:任一 BLOB 列非空且 > min_bytes。
+    MySQL 和 PostgreSQL 都支持 OCTET_LENGTH,quote 规则不同:
+      - MySQL 用反引号
+      - PostgreSQL 用双引号
+    """
+    quote = "`" if db_type == "mysql" else '"'
+    parts = [
+        f"({quote}{c}{quote} IS NOT NULL AND OCTET_LENGTH({quote}{c}{quote}) > {min_bytes})"
+        for c in blob_cols
+    ]
+    return " OR ".join(parts)
 
 
 def _sampled_rows(conn, db_type: str, table_name: str, pk_col):
@@ -264,23 +287,36 @@ def _scan_table(conn, db_type, db_name, table_name, writer, log: ScanLogger, lab
     import itertools
 
     pk_col = get_primary_key_col(conn, db_type, db_name, table_name)
-    row_count = 0
-    hit_count = 0
-    local_buffer = []
-
-    is_blob_table = _has_blob_column(conn, db_type, db_name, table_name)
+    blob_cols = _get_blob_columns(conn, db_type, db_name, table_name)
+    is_blob_table = bool(blob_cols)
 
     estimated = _estimate_row_count(conn, db_type, db_name, table_name)
     if estimated > SAMPLE_THRESHOLD:
         row_iter = _sampled_rows(conn, db_type, table_name, pk_col)
         log.info(label, f"表 {table_name} 估算 {estimated:,} 行，启用分层抽样")
+    elif is_blob_table:
+        # [1+2+3 第二轮] BLOB 表 SQL 层跳过 NULL/tiny blob,
+        # 避免 350s 预算浪费在空占位行上(约能节省 30-50% 的调度成本)
+        where_sql = _build_blob_where_sql(db_type, blob_cols, min_bytes=200)
+        log.info(label,
+                 f"表 {table_name} BLOB 列 {blob_cols},应用 NULL 过滤 "
+                 f"(OCTET_LENGTH > 200)")
+        row_iter = stream_table_rows(conn, db_type, table_name, pk_col,
+                                     where_sql=where_sql)
     else:
         row_iter = stream_table_rows(conn, db_type, table_name, pk_col)
 
     if is_blob_table:
         log.info(label, f"表 {table_name} 含 BLOB 列，限制最多扫 {BLOB_TABLE_MAX_ROWS} 行")
         row_iter = itertools.islice(row_iter, BLOB_TABLE_MAX_ROWS)
+        return _scan_blob_rows_parallel(
+            row_iter, writer, log, label, table_name, db_type, db_name,
+        )
 
+    # 非 BLOB 表:串行
+    row_count = 0
+    hit_count = 0
+    local_buffer = []
     deadline = time.time() + TABLE_TIMEOUT_SECONDS
     for pk_value, row in row_iter:
         if time.time() > deadline:
@@ -299,6 +335,85 @@ def _scan_table(conn, db_type, db_name, table_name, writer, log: ScanLogger, lab
                 if len(local_buffer) >= WRITER_BUFFER_SIZE:
                     _flush_buffer(writer, local_buffer)
         row_count += 1
+
+    _flush_buffer(writer, local_buffer)
+    return row_count, hit_count
+
+
+def _scan_blob_rows_parallel(row_iter, writer, log, label, table_name, db_type, db_name):
+    """
+    BLOB 表行级并行。
+
+    Why: 2026-04-21 第二轮 ocr_client 为 3-slot 池化 + DB_WORKERS=4 并发,
+    串行 dispatch 只能让一个 slot 忙,其它 slot 白嫖。这里开 ThreadPoolExecutor
+    (OCR_POOL_SIZE) 同时派多行进 dispatch,3 个 slot 才能并行吃 OCR。
+    DB cursor 非线程安全,所以行迭代仍由本线程独占,只把 dispatch() 派到 pool;
+    CSV 写入继续走 _writer_lock 串行化。
+
+    滑窗深度 = OCR_POOL_SIZE × 2,既不会让 pool 闲下来,也不会让 future 无限堆积。
+    deadline / _time_left 过期后不再提交新任务,已提交的 future 等它跑完收尾
+    (ocr_client 端 PER_IMAGE_TIMEOUT=25s 是最后一道保险)。
+    """
+    from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait as futures_wait
+    from scanners.ocr_client import OCR_POOL_SIZE
+
+    row_count = 0
+    hit_count = 0
+    local_buffer = []
+    in_flight = set()
+    window = max(2, OCR_POOL_SIZE * 2)
+
+    def _process_row(pk_value, row):
+        out = []
+        for field_name, value in row.items():
+            findings = dispatch(field_name, value, pk_value, table_name, db_type, db_name)
+            if findings:
+                out.extend(findings)
+        return out
+
+    def _collect(futs):
+        nonlocal hit_count
+        for f in futs:
+            try:
+                out = f.result()
+            except Exception as e:
+                log.error(label, f"表 {table_name} 行扫描异常: {e}")
+                continue
+            if out:
+                hit_count += len(out)
+                local_buffer.extend(out)
+        if len(local_buffer) >= WRITER_BUFFER_SIZE:
+            _flush_buffer(writer, local_buffer)
+
+    deadline = time.time() + TABLE_TIMEOUT_SECONDS
+    timed_out = False
+    budget_out = False
+
+    with ThreadPoolExecutor(max_workers=OCR_POOL_SIZE) as executor:
+        try:
+            for pk_value, row in row_iter:
+                if time.time() > deadline:
+                    timed_out = True
+                    break
+                if _time_left() <= 0:
+                    budget_out = True
+                    break
+
+                in_flight.add(executor.submit(_process_row, pk_value, row))
+                row_count += 1
+
+                while len(in_flight) >= window:
+                    done, in_flight = futures_wait(in_flight, return_when=FIRST_COMPLETED)
+                    _collect(done)
+        finally:
+            if in_flight:
+                _collect(in_flight)
+                in_flight.clear()
+
+    if timed_out:
+        log.warning(label, f"表 {table_name} 超时({TABLE_TIMEOUT_SECONDS}s)，已扫 {row_count} 行")
+    if budget_out:
+        log.warning(label, "总时间将耗尽，停止扫描")
 
     _flush_buffer(writer, local_buffer)
     return row_count, hit_count
@@ -336,8 +451,10 @@ def main():
             for db_name in cfg["databases"]
         ]
 
-        # [稳定性] DB_WORKERS=1 时直接在主线程串行扫描，跳过 ThreadPoolExecutor。
-        # PaddleOCR 在非主线程 + rich 后台刷新线程并存时容易段错误。
+        # [稳定性] DB_WORKERS=1 时直接在主线程串行扫描,跳过 ThreadPoolExecutor。
+        # [2026-04-21 第二轮] OCR 已放到 ocr_worker 子进程,主线程只做 SQL/正则,
+        # 线程安全。DB_WORKERS=4 启用 4 库并发扫描,非 BLOB 阶段 wall-clock 砍到 ~60s,
+        # BLOB 阶段由 fintech(2 张 BLOB 表) 决定约 900s。
         pool_size = min(DB_WORKERS, max(1, len(tasks)))
         if pool_size == 1:
             for db_type, db_name in tasks:

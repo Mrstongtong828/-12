@@ -1,0 +1,78 @@
+[ocr_worker] ocr call failed: could not create a primitive
+[OCR#0] 等待响应超时 25s,杀掉子进程
+[OCR#1] 等待响应超时 25s,杀掉子进程
+⠇ mysql/ecommerce_db  ━━━━━━━━━━━━━━━━━━━━━╺━━ 7/8 表 | 行 7,300 | 命中 12853 0:00:03
+⠇ mysql/fintech_db    ━━━━━━━━━━━━━━━━━╺━━━━━━ 5/7 表 | 行 5,000 | 命中 8416  0:00:03[ocr_worker] retry also failed: could not create a primitive
+[ocr_worker] ocr call failed: could not create a primitive
+[ocr_worker] retry also failed: could not create a primitive
+[ocr_worker] ocr call failed: could not create a primitive
+[ocr_worker] retry also failed: could not create a primitive
+[ocr_worker] ocr call failed: could not create a primitive
+[ocr_worker] ocr call failed: could not create a primitive
+[OCR#2] 读取响应失败: short header (worker exited)
+[OCR#1] 读取响应失败: short header (worker exited)
+⠇ mysql/ecommerce_db  ━━━━━━━━━━━━━━━━━━━━━╺━━ 7/8 表 | 行 7,300 | 命中 12853 0:00:03
+⠇ mysql/fintech_db    ━━━━━━━━━━━━━━━━━╺━━━━━━ 5/7 表 | 行 5,000 | 命中 8416  0:00:03[ocr_worker] ocr call failed: Unable to allocate 7.38 MiB for an array with shape (960, 672, 3) and data type float32
+[ocr_worker] ocr call failed: could not create a primitive
+[OCR#0] 等待响应超时 25s,杀掉子进程
+[OCR#2] 等待响应超时 25s,杀掉子进程
+[OCR#1] 等待响应超时 25s,杀掉子进程
+⠇ mysql/ecommerce_db  ━━━━━━━━━━━━━━━━━━━━━╺━━ 7/8 表 | 行 7,300 | 命中 12853 0:00:03
+⠇ mysql/fintech_db    ━━━━━━━━━━━━━━━━━╺━━━━━━ 5/7 表 | 行 5,000 | 命中 8416  0:00:03[ocr_worker] ocr call failed: Unable to allocate 1.01 MiB for an array with shape (1, 40, 6625) and data type float32
+[OCR#2] 等待响应超时 25s,杀掉子进程
+[OCR#0] 等待响应超时 25s,杀掉子进程
+[OCR#1] 读取响应失败: short header (worker exited)
+[WARN] mysql/fintech_db — 表 contract_archive 超时(450s)，已扫 82 行
+[ERROR] 扫描MySQL存储过程/函数失败 ecommerce_db: (2013, 'Lost connection to MySQL server during query ([WinError 10060]
+由于连接方在一段时间后没有正确答复或连接的主机没有反应，连接尝试失败。)')
+[ERROR] 扫描MySQL触发器失败 ecommerce_db: (0, '')
+[ERROR] 列出MySQL视图失败 ecommerce_db: (0, '')
+postgresql/healthcare_db 发现 7 张表
+postgresql/healthcare_db 发现 1 张 BLOB 表,延后扫描: ['medical_images']
+[ERROR] 获取主键失败 kyc_verification: (2013, 'Lost connection to MySQL server during query ([WinError 10060]
+由于连接方在一段时间后没有正确答复或连接的主机没有反应，连接尝试失败。)')
+[ERROR] 流式读取 kyc_verification 失败: (0, '')
+[ERROR] 扫描MySQL存储过程/函数失败 fintech_db: (0, '')
+[ERROR] 扫描MySQL触发器失败 fintech_db: (0, '')
+[ERROR] 列出MySQL视图失败 fintech_db: (0, '')
+postgresql/govservice_db 发现 7 张表
+postgresql/govservice_db 发现 1 张 BLOB 表,延后扫描: ['citizen_documents']
+postgresql/healthcare_db 表 medical_images BLOB 列 ['img_data'],应用 NULL 过滤 (OCTET_LENGTH > 200)
+postgresql/healthcare_db 表 medical_images 含 BLOB 列，限制最多扫 800 行
+postgresql/govservice_db 表 citizen_documents BLOB 列 ['doc_data'],应用 NULL 过滤 (OCTET_LENGTH > 200)
+postgresql/govservice_db 表 citizen_documents 含 BLOB 列，限制最多扫 800 行
+  mysql/ecommerce_db        ━━━━━━━━━━━━━━━━━━━━━━━━ 8/8 表 | 行 7,402 | 命中 13091 0:08:09
+  mysql/fintech_db          ━━━━━━━━━━━━━━━━━━━━━━━━ 7/7 表 | 行 5,082 | 命中 8827  0:08:30
+⠴ postgresql/healthcare_db  ━━━━━━━━━━━━━━━━━━━━╸━━━ 6/7 表 | 行 7,000 | 命中 13857 0:00:03
+⠴ postgresql/govservice_db  ━━━━━━━━━━━━━━━━━━━━╸━━━ 6/7 表 | 行 5,200 | 命中 14116 0:00:02[ocr_worker] ocr call failed: could not create a memory object
+[OCR#0] 等待响应超时 25s,杀掉子进程
+  mysql/ecommerce_db        ━━━━━━━━━━━━━━━━━━━━━━━━ 8/8 表 | 行 7,402 | 命中 13091 0:08:09
+  mysql/fintech_db          ━━━━━━━━━━━━━━━━━━━━━━━━ 7/7 表 | 行 5,082 | 命中 8827  0:08:30
+[OCR#2] 读取响应失败: short header (worker exited)
+[OCR#2] 等待响应超时 25s,杀掉子进程
+[OCR#1] 等待响应超时 25s,杀掉子进程
+[OCR#0] 等待响应超时 25s,杀掉子进程
+[OCR#2] 读取响应失败: short header (worker exited)
+[OCR#0] 读取响应失败: short header (worker exited)
+[OCR#1] 读取响应失败: short header (worker exited)
+  mysql/ecommerce_db        ━━━━━━━━━━━━━━━━━━━━━━━━ 8/8 表 | 行 7,402 | 命中 13091 0:08:09
+  mysql/fintech_db          ━━━━━━━━━━━━━━━━━━━━━━━━ 7/7 表 | 行 5,082 | 命中 8827  0:08:30
+⠴ postgresql/healthcare_db  ━━━━━━━━━━━━━━━━━━━━╸━━━ 6/7 表 | 行 7,000 | 命中 13857 0:00:03
+[OCR#2] 等待响应超时 25s,杀掉子进程
+[OCR#1] 等待响应超时 25s,杀掉子进程
+[OCR#0] 等待响应超时 25s,杀掉子进程
+[WARN] postgresql/govservice_db — 表 citizen_documents 超时(450s)，已扫 126 行
+postgresql/govservice_db db_object 发现 2 条
+[WARN] postgresql/healthcare_db — 表 medical_images 超时(450s)，已扫 122 行
+postgresql/healthcare_db db_object 发现 1 条
+system 完成 耗时=981.7s | AI推理 0次 | 均值 0.0s/次 | 平均等待 0.0s/次
+─────────────────────────────────────────────────────── 扫描摘要 ───────────────────────────────────────────────────────
+  mysql/ecommerce_db: 8表 / 7,402行 / 13091命中
+  mysql/fintech_db: 7表 / 5,082行 / 8827命中
+  postgresql/healthcare_db: 7表 / 7,122行 / 14177命中
+  postgresql/govservice_db: 7表 / 5,326行 / 14655命中
+  合计: 24,932 行 | 50750 条发现
+  mysql/ecommerce_db        ━━━━━━━━━━━━━━━━━━━━━━━━ 8/8 表 | 行 7,402 | 命中 13091 0:08:09
+  mysql/fintech_db          ━━━━━━━━━━━━━━━━━━━━━━━━ 7/7 表 | 行 5,082 | 命中 8827  0:08:30
+  postgresql/healthcare_db  ━━━━━━━━━━━━━━━━━━━━━━━━ 7/7 表 | 行 7,122 | 命中 14177 0:07:53
+  postgresql/govservice_db  ━━━━━━━━━━━━━━━━━━━━━━━━ 7/7 表 | 行 5,326 | 命中 14655 0:07:50

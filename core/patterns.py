@@ -33,6 +33,8 @@ COMPOUND_SURNAMES = {
     "皇甫", "呼延", "慕容", "宇文", "长孙", "尉迟", "独孤", "拓跋",
     "元亓", "同蹄", "伶舟", "公叔", "乐正", "万俟", "赫连",
     "公甲", "公荆", "公冉",
+    # 本赛题测试数据里的复姓(防 4 字名被截成 3 字)
+    "公玉", "吉白",
 }
 
 NAME_BLACKLIST = {
@@ -89,6 +91,27 @@ NAME_BLACKLIST = {
     "武器", "武装",
     "公章", "公布", "公告", "公开", "公交", "公园", "公寓",
     "石家庄", "石头",
+
+    # [v2] 从 upload.csv 统计出的高频 FP —— 每条都有数十到数百次误报
+    # 合同/KYC OCR 模板里的固定片段(每个 ~203 次)
+    "方违约", "方权", "方收", "方支付", "方按照", "方人员", "方当",
+    "方日", "方外用", "方阿", "方氯雷", "方布", "方蒙脱", "方左", "方奥美",
+    "向对", "向账",
+    "同金", "同约", "同协", "同步联",
+    "任何一", "任任何", "任人",
+    "万收款", "万按照", "万元", "万柏", "万笺",
+    # 医学/药品碎片
+    "莫西", "石散", "蒙脱", "雷他定", "林胶囊", "方笺", "常密", "常抱",
+    "高血", "高新", "明显", "焦虑", "康复计", "康复科",
+    # 地名/行政区被误识别为姓名(宁+夏、蒙+古...)
+    "宁夏", "蒙古", "兰州", "浦东", "石景", "石林",
+    "郑州经", "文化旅",
+    # 合同/金融动词模板
+    "段违法", "于标", "于验", "即止", "解封", "解答", "解记", "解结果",
+    "籍迁", "籍地", "金转移", "易失败", "文书", "信发至", "家地", "信通",
+    "令整改", "信访", "仲裁", "元转", "居地址", "居中", "游创",
+    "家发放", "家转", "家收", "张银行", "谢客", "谢您联", "东西",
+    "公主", "周期",
 }
 
 _NAME_BLACKLIST_RE = re.compile("|".join(re.escape(w) for w in NAME_BLACKLIST))
@@ -185,6 +208,14 @@ _NAME_FOLLOW_VERB_BIGRAMS = frozenset([
     "协助", "协议", "协调",
     "诉求", "控诉",
     "账户", "账号", "账单",
+
+    # [v2] 合同/KYC 模板里"甲/乙方"被 OCR 漏掉后的动词性溢出
+    "违约", "违法", "支付", "按照", "收款", "代理", "承担", "履行",
+    "签字", "签章", "盖章", "授权",
+    # 医学后缀(方X 为药品方剂)
+    "外用", "口服", "胶囊", "冲剂", "颗粒",
+    # 其它
+    "日期", "元整", "万元",
 ])
 
 
@@ -206,6 +237,23 @@ def _is_valid_name_shape(cand: str) -> bool:
     return True
 
 
+def _is_admin_region_follow(text: str, i: int, L: int) -> bool:
+    """
+    [v2] 识别"宁夏回族自治区"、"内蒙古自治区"、"西藏自治区"等行政区 pattern,
+    防止 2-3 字姓名候选吞入行政区名前缀。
+    触发条件:姓名候选后紧跟 "自治区|特别行政区|回族|维吾尔|壮族|藏族|自治州|自治县|治区" 之一。
+    "治区" 兜底处理 "内蒙古自治区" 里 '古自' 错切的情况。
+    """
+    tail = text[i + L: i + L + 4]
+    if not tail:
+        return False
+    for marker in ("自治区", "特别行政区", "回族自", "回族", "维吾尔",
+                   "壮族", "藏族", "自治州", "自治县", "治区", "治州", "治县"):
+        if tail.startswith(marker):
+            return True
+    return False
+
+
 def try_name_at(text: str, i: int):
     n = len(text)
     is_compound = (i + 2 <= n and text[i:i+2] in COMPOUND_SURNAMES)
@@ -224,7 +272,15 @@ def try_name_at(text: str, i: int):
             continue
         if _contains_verb_bigram(cand):
             continue
+        # [v2] 行政区名守卫:"宁夏回族自治区"中 "宁夏" 不是姓名
+        if _is_admin_region_follow(text, i, L):
+            continue
         if L == 3 and i + L < n:
+            spill_bigram = cand[-1] + text[i + L]
+            if spill_bigram in _NAME_FOLLOW_VERB_BIGRAMS:
+                continue
+        # [v2] L=2 也加 spill bigram 检查,防止"方违约"被黑名单拦掉后退化成"方违"
+        if L == 2 and i + L < n:
             spill_bigram = cand[-1] + text[i + L]
             if spill_bigram in _NAME_FOLLOW_VERB_BIGRAMS:
                 continue

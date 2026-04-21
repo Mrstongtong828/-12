@@ -230,12 +230,23 @@ def _pick_pk_from_cols(cols, table_name, is_mysql=True):
  
 
 
-def stream_table_rows(conn, db_type: str, table_name: str, pk_col):
+def stream_table_rows(conn, db_type: str, table_name: str, pk_col,
+                      where_sql: str = None):
+    """
+    流式读取表行。可选 where_sql(不含 WHERE 关键字)用于 BLOB 表跳过空行 —
+    e.g. "(doc_image IS NOT NULL AND OCTET_LENGTH(doc_image) > 200)"。
+    仅在带 where_sql 时加 ORDER BY pk_col:让 BLOB 表超时前优先覆盖低 record_id,
+    同时避免给普通表多加排序成本。
+    """
     FETCH_SIZE = 500  # [P3] 从 200 提升到 500，减少网络往返次数
+    where_clause = f" WHERE {where_sql}" if where_sql else ""
+    use_order = bool(where_sql) and bool(pk_col)
     try:
         if db_type == "mysql":
+            order_clause = f" ORDER BY `{pk_col}` ASC" if use_order else ""
+            sql = f"SELECT * FROM `{table_name}`{where_clause}{order_clause}"
             with conn.cursor() as cur:
-                cur.execute(f"SELECT * FROM `{table_name}`")
+                cur.execute(sql)
                 row_num = 0
                 while True:
                     rows = cur.fetchmany(FETCH_SIZE)
@@ -247,9 +258,11 @@ def stream_table_rows(conn, db_type: str, table_name: str, pk_col):
                         pk_value = fixed.get(pk_col, row_num) if pk_col else row_num
                         yield (pk_value, fixed)
         elif db_type == "postgresql":
+            order_clause = f' ORDER BY "{pk_col}" ASC' if use_order else ""
+            sql = f'SELECT * FROM "{table_name}"{where_clause}{order_clause}'
             # [B6] 用 with 管理 cursor，确保生成器提前关闭（超时 break）时也能释放游标
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(f'SELECT * FROM "{table_name}"')
+                cur.execute(sql)
                 row_num = 0
                 while True:
                     rows = cur.fetchmany(FETCH_SIZE)
