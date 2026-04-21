@@ -385,7 +385,19 @@ def _unwrap_encoded_blob(data: bytes) -> bytes:
 def _sniff_file_type(data: bytes) -> str:
     if not data or len(data) < 8: return "unknown"
     if data[:4] == b'%PDF': return "pdf"
-    if data[:2] == b'\xff\xd8' or data[:4] == b'\x89PNG' or data[:4] == b'GIF8' or data[:2] == b'BM' or data[:4] == b'RIFF':
+    # 图片 magic bytes 白名单(严格):
+    #   JPEG / PNG / GIF / BMP / TIFF(大小端) / WEBP(RIFF 容器且 FourCC == WEBP)
+    # Why: 裸 RIFF 也覆盖 WAV/AVI 等非图容器,cv2 会对其"努力解出"噪声像素,
+    #      PaddleOCR 拿到后在 det/rec 阶段易触发 primitive 失败 → slot 崩溃。
+    #      这里把 RIFF 收紧到 WEBP,其它 RIFF 容器降为 unknown,走字节兜底。
+    if (data[:2] == b'\xff\xd8'                     # JPEG
+            or data[:4] == b'\x89PNG'               # PNG
+            or data[:4] == b'GIF8'                  # GIF
+            or data[:2] == b'BM'                    # BMP
+            or data[:4] == b'II*\x00'               # TIFF little-endian
+            or data[:4] == b'MM\x00*'):             # TIFF big-endian
+        return "image"
+    if data[:4] == b'RIFF' and len(data) >= 12 and data[8:12] == b'WEBP':
         return "image"
     if data[:4] == b'PK\x03\x04':
         head = data[:4096]
@@ -747,7 +759,11 @@ def scan_blob_data(blob_bytes, record_id, table_name, field_col_name,
         raw_text = _extract_xlsx_text(data)
         return _collect_findings_simple(raw_text, record_id, table_name, field_col_name, db_type, db_name)
 
-    # 图像或未知格式 -> 触发高规格容错处理: OCR + 预处理 + 多路径扫描
+    # 仅对明确识别为 image 的字节调 OCR(白名单)。
+    # Why: 之前逻辑对 ftype=="unknown" 的字节也送 OCR(cv2.imdecode 会对任意字节
+    #      "努力解出"噪声像素),PaddleOCR 对这类诡异输入常在 det/rec 触发
+    #      primitive 失败 / OOM 导致 slot 崩溃(v7 日志 slot 永久停用的主因)。
+    #      unknown 字节统一改走下面的字节级文本兜底,不再进 OCR 管线。
     findings = []
     seen_keys = set()
 
@@ -759,8 +775,8 @@ def scan_blob_data(blob_bytes, record_id, table_name, field_col_name,
             seen_keys.add(key)
             findings.append(h)
 
-    # 主路径:OCR + 预处理 + 多路径正则
-    if not ocr_disabled():
+    # 主路径:OCR + 预处理 + 多路径正则(仅 image)
+    if ftype == "image" and not ocr_disabled():
         raw_text = get_ocr_text(data)
         if raw_text:
             processed = _preprocess_ocr_text(raw_text)

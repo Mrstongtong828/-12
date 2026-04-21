@@ -267,6 +267,28 @@ class _OCRPool:
 _pool = _OCRPool(OCR_POOL_SIZE)
 
 
+# 图片 magic bytes(与 blob._sniff_file_type 对齐,但 inline 以免循环依赖)
+# RIFF 必须带 WEBP FourCC 才算图;裸 RIFF(WAV/AVI)一律拒入 OCR。
+_IMAGE_MAGICS_HEAD = (
+    b'\xff\xd8',      # JPEG
+    b'\x89PNG',       # PNG
+    b'GIF8',          # GIF
+    b'BM',            # BMP
+    b'II*\x00',       # TIFF LE
+    b'MM\x00*',       # TIFF BE
+)
+# Paddle imdecode 阶段就能吃满内存,此阈值之上直接拒绝,避免 slot 挂死
+OCR_MAX_BYTES = 10 * 1024 * 1024   # 10MB
+
+
+def _looks_like_image(buf: bytes) -> bool:
+    if len(buf) < 8:
+        return False
+    if buf[:4] == b'RIFF':
+        return len(buf) >= 12 and buf[8:12] == b'WEBP'
+    return any(buf.startswith(m) for m in _IMAGE_MAGICS_HEAD)
+
+
 def get_ocr_text(image_bytes):
     if isinstance(image_bytes, memoryview):
         image_bytes = bytes(image_bytes)
@@ -274,6 +296,12 @@ def get_ocr_text(image_bytes):
         image_bytes = bytes(image_bytes)
     if not isinstance(image_bytes, bytes):
         return None
+    # 双保险:上游 blob.py 已做白名单;此处再验一次 magic + 大小上限,
+    # 保护 PDF OCR 路径(pix.tobytes("png")→PNG,天然通过)以及未来可能新增的入口。
+    if not _looks_like_image(image_bytes):
+        return ""
+    if len(image_bytes) > OCR_MAX_BYTES:
+        return ""
     return _pool.get_text(image_bytes)
 
 
