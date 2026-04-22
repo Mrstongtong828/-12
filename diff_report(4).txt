@@ -1,0 +1,329 @@
+
+══════════════════════════════════════════════════════════════════════
+  0. 汇总
+══════════════════════════════════════════════════════════════════════
+  upload 总行: 54660
+  example 总行: 580 (只是样本,不是全量答案)
+  TP (两边都有, 精确匹配): 539
+  FP (upload 有, example 没有): 54121  ← 含真答案 + 真误报
+  FN (example 有, upload 没有): 41  ← 纯漏报, 最重要
+
+══════════════════════════════════════════════════════════════════════
+  1. FN(漏报) 按 data_form 分布 —— 重点优化对象
+══════════════════════════════════════════════════════════════════════
+  structured             漏   0/178  (  0.0%)
+  unstructured_text      漏   0/166  (  0.0%)
+  semi_structured        漏   0/95   (  0.0%)
+  binary_blob            漏  41/72   ( 56.9%)
+  encoded                漏   0/69   (  0.0%)
+
+══════════════════════════════════════════════════════════════════════
+  2. FN 按 sensitive_type 分布
+══════════════════════════════════════════════════════════════════════
+  PHONE_NUMBER                   漏   0/138  (  0.0%)
+  ID_CARD                        漏  10/110  (  9.1%)
+  CHINESE_NAME                   漏  10/104  (  9.6%)
+  ADDRESS                        漏   7/69   ( 10.1%)
+  BANK_CARD                      漏   8/47   ( 17.0%)
+  EMAIL                          漏   0/34   (  0.0%)
+  MEDICAL_RECORD_NO              漏   6/17   ( 35.3%) ⚠️
+  IP_ADDRESS                     漏   0/15   (  0.0%)
+  SOCIAL_SECURITY_NO             漏   0/13   (  0.0%)
+  HOUSING_FUND_NO                漏   0/11   (  0.0%)
+  VIN_CODE                       漏   0/11   (  0.0%)
+  MEDICAL_INSURANCE_NO           漏   0/6    (  0.0%)
+  LICENSE_PLATE                  漏   0/3    (  0.0%)
+  MAC_ADDRESS                    漏   0/1    (  0.0%)
+  USCC                           漏   0/1    (  0.0%)
+
+══════════════════════════════════════════════════════════════════════
+  3. FN 全量清单 —— 这些是你代码没识别到的官方答案
+══════════════════════════════════════════════════════════════════════
+
+  ━━━ binary_blob (41 条漏报) ━━━
+    [postgresql/govservice_db.citizen_documents.doc_data #372] binary_blob/ADDRESS(L3) = '湖北省武汉市青山区冶金街道019号865室'
+    [mysql/fintech_db.kyc_verification.doc_image #320] binary_blob/BANK_CARD(L4) = '62256878768768343'
+    [postgresql/govservice_db.citizen_documents.doc_data #70] binary_blob/ADDRESS(L3) = '福建省福州市晋安区日溪乡1356号532室'
+    [postgresql/healthcare_db.medical_images.img_data #422] binary_blob/CHINESE_NAME(L3) = '高绿蕊'
+    [mysql/fintech_db.kyc_verification.doc_image #558] binary_blob/BANK_CARD(L4) = '622908482453926473'
+    [postgresql/healthcare_db.medical_images.img_data #398] binary_blob/ID_CARD(L4) = '330102195808155038'
+    [postgresql/healthcare_db.medical_images.img_data #171] binary_blob/MEDICAL_RECORD_NO(L3) = 'MR202057404'
+    [postgresql/govservice_db.citizen_documents.doc_data #397] binary_blob/ADDRESS(L3) = '海南省海口市琼山区三门坡镇782号539室'
+    [postgresql/govservice_db.citizen_documents.doc_data #467] binary_blob/ADDRESS(L3) = '吉林省长春市德惠市菜园子镇457号754室'
+    [mysql/ecommerce_db.user_attachments.file_data #509] binary_blob/CHINESE_NAME(L3) = '赵乐荷'
+    [mysql/fintech_db.kyc_verification.doc_image #61] binary_blob/BANK_CARD(L4) = '622848192442335404'
+    [mysql/fintech_db.kyc_verification.doc_image #696] binary_blob/BANK_CARD(L4) = '622200969020267766'
+    [mysql/fintech_db.contract_archive.doc_image #292] binary_blob/ADDRESS(L3) = '重庆市巴南区南彭街道1047号406室'
+    [postgresql/healthcare_db.medical_images.img_data #170] binary_blob/MEDICAL_RECORD_NO(L3) = 'MR202644493'
+    [postgresql/govservice_db.citizen_documents.doc_data #485] binary_blob/ID_CARD(L4) = '500111197209092669'
+    [postgresql/healthcare_db.medical_images.img_data #278] binary_blob/CHINESE_NAME(L3) = '尚睿范'
+    [mysql/fintech_db.kyc_verification.doc_image #599] binary_blob/ID_CARD(L4) = '500116195511182414'
+    [postgresql/healthcare_db.medical_images.img_data #546] binary_blob/MEDICAL_RECORD_NO(L3) = 'MR202649005'
+    [mysql/fintech_db.kyc_verification.doc_image #313] binary_blob/CHINESE_NAME(L3) = '贡国兴'
+    [mysql/ecommerce_db.user_attachments.file_data #648] binary_blob/BANK_CARD(L4) = '6221883738965105227'
+    [postgresql/healthcare_db.medical_images.img_data #468] binary_blob/CHINESE_NAME(L3) = '万幼萱'
+    [postgresql/healthcare_db.medical_images.img_data #423] binary_blob/MEDICAL_RECORD_NO(L3) = 'MR202470350'
+    [mysql/fintech_db.kyc_verification.doc_image #206] binary_blob/ID_CARD(L4) = '110112195001023546'
+    [mysql/fintech_db.kyc_verification.doc_image #280] binary_blob/ID_CARD(L4) = '310110198408059231'
+    [postgresql/govservice_db.citizen_documents.doc_data #51] binary_blob/ADDRESS(L3) = '浙江省杭州市钱塘区前进街道761号290室'
+    [mysql/ecommerce_db.user_attachments.file_data #544] binary_blob/CHINESE_NAME(L3) = '明蔚'
+    [mysql/fintech_db.contract_archive.doc_image #255] binary_blob/ADDRESS(L3) = '四川省成都市锦江区东湖街道1196号578室'
+    [postgresql/healthcare_db.medical_images.img_data #235] binary_blob/MEDICAL_RECORD_NO(L3) = 'MR202259462'
+    [postgresql/healthcare_db.medical_images.img_data #516] binary_blob/ID_CARD(L4) = '340122198905301210'
+    [mysql/fintech_db.kyc_verification.doc_image #413] binary_blob/ID_CARD(L4) = '650106196212161052'
+    [mysql/ecommerce_db.user_attachments.file_data #377] binary_blob/BANK_CARD(L4) = '622609751761722564'
+    [mysql/fintech_db.contract_archive.doc_image #159] binary_blob/CHINESE_NAME(L3) = '元亓微澜'
+    [postgresql/healthcare_db.medical_images.img_data #537] binary_blob/ID_CARD(L4) = '420103197006102935'
+    [mysql/fintech_db.kyc_verification.doc_image #461] binary_blob/ID_CARD(L4) = '44011319810311893X'
+    [mysql/fintech_db.kyc_verification.doc_image #585] binary_blob/CHINESE_NAME(L3) = '储天干'
+    [postgresql/healthcare_db.medical_images.img_data #596] binary_blob/MEDICAL_RECORD_NO(L3) = 'MR202369593'
+    [postgresql/healthcare_db.medical_images.img_data #198] binary_blob/ID_CARD(L4) = '500116195511182414'
+    [mysql/fintech_db.kyc_verification.doc_image #277] binary_blob/BANK_CARD(L4) = '62284879961769423'
+    [postgresql/healthcare_db.medical_images.img_data #376] binary_blob/CHINESE_NAME(L3) = '步宏伯'
+    [postgresql/healthcare_db.medical_images.img_data #796] binary_blob/CHINESE_NAME(L3) = '吉白菀'
+    [mysql/fintech_db.kyc_verification.doc_image #413] binary_blob/BANK_CARD(L4) = '622848933712390169'
+
+══════════════════════════════════════════════════════════════════════
+  4. FP 的 field_name top 20(可能是你误报的)
+══════════════════════════════════════════════════════════════════════
+  [说明] 仅看 example 覆盖的 (db,table,field) 位置内的 FP,共 54116 条
+  note_text                           5148
+  description                         4500
+  encoded_report                      3066
+  encoded_rx                          2592
+  doc_image                           2517
+  app_json                            2502
+  content                             2469
+  ext_json                            2227
+  action_text                         1947
+  phone                               1865
+  risk_json                           1744
+  encoded_payload                     1698
+  record_json                         1678
+  doc_data                            1580
+  id_number                           1385
+  claim_data                          1212
+  full_address                        1082
+  license_json                        1004
+  id_verify                            960
+  mobile                               952
+
+══════════════════════════════════════════════════════════════════════
+  5. FP 样本(每种类型 10 条)—— 看误报 pattern
+══════════════════════════════════════════════════════════════════════
+
+  ━━━ PHONE_NUMBER (11949 条 FP) ━━━
+    [postgresql/govservice_db.case_records.description #133] unstructured_text/PHONE_NUMBER(L3) = '17728334100'
+    [mysql/fintech_db.credit_report.encoded_report #492] encoded/PHONE_NUMBER(L3) = '17206893939'
+    [postgresql/healthcare_db.patient_master.contact_phone #675] structured/PHONE_NUMBER(L3) = '16645728477'
+    [postgresql/healthcare_db.clinical_records.record_json #611] semi_structured/PHONE_NUMBER(L3) = '17492725220'
+    [mysql/ecommerce_db.user_profile.phone #4] structured/PHONE_NUMBER(L3) = '18724391658'
+    [mysql/ecommerce_db.payment_detail.encoded_payload #544] encoded/PHONE_NUMBER(L3) = '18141114515'
+    [mysql/ecommerce_db.shipping_address.mobile #352] structured/PHONE_NUMBER(L3) = '13299397281'
+    [postgresql/govservice_db.citizen_documents.doc_data #345] binary_blob/PHONE_NUMBER(L3) = '17831405375'
+    [postgresql/healthcare_db.consultation_notes.note_text #1306] unstructured_text/PHONE_NUMBER(L3) = '14527115379'
+    [postgresql/healthcare_db.consultation_notes.note_text #949] unstructured_text/PHONE_NUMBER(L3) = '19302542775'
+
+  ━━━ ID_CARD (10567 条 FP) ━━━
+    [postgresql/healthcare_db.clinical_records.record_json #137] semi_structured/ID_CARD(L4) = '500104200410016319'
+    [postgresql/healthcare_db.clinical_records.record_json #297] semi_structured/ID_CARD(L4) = '440117200804077881'
+    [mysql/ecommerce_db.shipping_address.id_verify #411] structured/ID_CARD(L4) = '630106199904041123'
+    [postgresql/govservice_db.case_records.description #1161] unstructured_text/ID_CARD(L4) = '210115195904188061'
+    [postgresql/govservice_db.case_records.description #166] unstructured_text/ID_CARD(L4) = '640106198104232447'
+    [postgresql/govservice_db.service_applications.app_json #56] semi_structured/ID_CARD(L4) = '620123201003074512'
+    [postgresql/govservice_db.vehicle_records.owner_id #6] structured/ID_CARD(L4) = '320115199210242661'
+    [mysql/fintech_db.credit_report.encoded_report #423] encoded/ID_CARD(L4) = '110105200407012361'
+    [postgresql/govservice_db.citizen_registry.id_number #352] structured/ID_CARD(L4) = '360121199706081552'
+    [postgresql/govservice_db.vehicle_records.owner_id #168] structured/ID_CARD(L4) = '230129197603112363'
+
+  ━━━ CHINESE_NAME (9463 条 FP) ━━━
+    [mysql/ecommerce_db.order_ext_data.ext_json #297] semi_structured/CHINESE_NAME(L3) = '公成千'
+    [postgresql/govservice_db.citizen_documents.doc_data #246] binary_blob/CHINESE_NAME(L3) = '宁家'
+    [postgresql/govservice_db.case_records.description #199] unstructured_text/CHINESE_NAME(L3) = '储绮梅'
+    [postgresql/govservice_db.citizen_registry.full_name #236] structured/CHINESE_NAME(L3) = '信都韵'
+    [postgresql/govservice_db.citizen_registry.full_name #765] structured/CHINESE_NAME(L3) = '公仪琳'
+    [postgresql/govservice_db.case_records.description #405] unstructured_text/CHINESE_NAME(L3) = '方人'
+    [postgresql/govservice_db.business_license.license_json #408] semi_structured/CHINESE_NAME(L3) = '花学英'
+    [mysql/ecommerce_db.order_ext_data.ext_json #737] semi_structured/CHINESE_NAME(L3) = '华光明'
+    [postgresql/healthcare_db.patient_master.patient_name #675] structured/CHINESE_NAME(L3) = '阚映之'
+    [mysql/ecommerce_db.shipping_address.consignee #564] structured/CHINESE_NAME(L3) = '乐正飞沉'
+
+  ━━━ ADDRESS (8146 条 FP) ━━━
+    [postgresql/govservice_db.citizen_registry.domicile #19] structured/ADDRESS(L3) = '吉林省长春市双阳区云山街道1066号611室'
+    [mysql/ecommerce_db.shipping_address.full_address #531] structured/ADDRESS(L3) = '河南省郑州市郑州经济技术开发区郑州经济技术开发区明湖街道1156号487室'
+    [mysql/ecommerce_db.order_ext_data.ext_json #589] semi_structured/ADDRESS(L3) = '安徽省合肥市肥东县合肥循环经济示范园1219号186室'
+    [postgresql/govservice_db.service_applications.app_json #226] semi_structured/ADDRESS(L3) = '北京市海淀区曙光街道522号894室'
+    [postgresql/healthcare_db.consultation_notes.note_text #551] unstructured_text/ADDRESS(L3) = '天津市滨海新区海滨街道559号706室'
+    [postgresql/govservice_db.business_license.license_json #448] semi_structured/ADDRESS(L3) = '云南省昆明市富民县东村镇1097号305室'
+    [mysql/ecommerce_db.order_ext_data.ext_json #35] semi_structured/ADDRESS(L3) = '辽宁省沈阳市浑南区白塔街道813号243室'
+    [postgresql/govservice_db.case_records.description #728] unstructured_text/ADDRESS(L3) = '宁夏回族自治区银川市灵武市崇兴镇545号789室'
+    [mysql/ecommerce_db.order_ext_data.ext_json #417] semi_structured/ADDRESS(L3) = '宁夏回族自治区银川市西夏区北京西路街道833号329室'
+    [postgresql/healthcare_db.patient_master.home_address #177] structured/ADDRESS(L3) = '青海省西宁市城北区朝阳街道1080号207室'
+
+  ━━━ BANK_CARD (4413 条 FP) ━━━
+    [mysql/ecommerce_db.payment_detail.encoded_payload #601] encoded/BANK_CARD(L4) = '621700820652665735'
+    [mysql/fintech_db.credit_report.encoded_report #163] encoded/BANK_CARD(L4) = '6227009298779351620'
+    [postgresql/healthcare_db.clinical_records.record_json #654] semi_structured/BANK_CARD(L4) = '6221881010157488'
+    [mysql/fintech_db.credit_report.encoded_report #665] encoded/BANK_CARD(L4) = '622188503678673326'
+    [postgresql/healthcare_db.insurance_claims.claim_data #646] semi_structured/BANK_CARD(L4) = '62226206507941376'
+    [mysql/fintech_db.credit_report.encoded_report #621] encoded/BANK_CARD(L4) = '6217008582672266'
+    [postgresql/healthcare_db.insurance_claims.claim_data #761] semi_structured/BANK_CARD(L4) = '6217008129250585646'
+    [mysql/fintech_db.risk_assessment.risk_json #854] semi_structured/BANK_CARD(L4) = '62284884946138579'
+    [mysql/fintech_db.audit_trail.action_text #119] unstructured_text/BANK_CARD(L4) = '6225684705415279680'
+    [mysql/ecommerce_db.payment_detail.encoded_payload #16] encoded/BANK_CARD(L4) = '6222629488977849'
+
+  ━━━ EMAIL (2984 条 FP) ━━━
+    [mysql/ecommerce_db.login_log.log_text #244] unstructured_text/EMAIL(L3) = 'nclyjcnsj4japli8@sohu.com'
+    [mysql/ecommerce_db.order_ext_data.ext_json #174] semi_structured/EMAIL(L3) = 'akkumandispa1r@sohu.com'
+    [mysql/ecommerce_db.order_ext_data.ext_json #247] semi_structured/EMAIL(L3) = '1jkaw0q6xqlnd9y@sohu.com'
+    [mysql/ecommerce_db.login_log.log_text #337] unstructured_text/EMAIL(L3) = 'sq5mbl8l24@yahoo.com'
+    [mysql/ecommerce_db.user_profile.email #715] structured/EMAIL(L3) = '1jss5e8jdyydyb1r6i@yahoo.com'
+    [mysql/ecommerce_db.login_log.log_text #366] unstructured_text/EMAIL(L3) = 'lina@163.com'
+    [mysql/ecommerce_db.user_profile.email #995] structured/EMAIL(L3) = 'jlwxwu1r@163.com'
+    [mysql/ecommerce_db.user_profile.email #174] structured/EMAIL(L3) = 'rh4k4jken@yahoo.com'
+    [mysql/fintech_db.audit_trail.action_text #216] unstructured_text/EMAIL(L3) = '2mmk@hotmail.com'
+    [mysql/fintech_db.audit_trail.action_text #981] unstructured_text/EMAIL(L3) = 'w3qz3vhpbqenf@yahoo.com'
+
+  ━━━ IP_ADDRESS (1342 条 FP) ━━━
+    [mysql/fintech_db.audit_trail.action_text #883] unstructured_text/IP_ADDRESS(L2) = '172.27.161.184'
+    [mysql/fintech_db.audit_trail.action_text #169] unstructured_text/IP_ADDRESS(L2) = '192.168.150.58'
+    [mysql/ecommerce_db.login_log.log_text #10] unstructured_text/IP_ADDRESS(L2) = '192.168.99.143'
+    [mysql/ecommerce_db.login_log.log_text #158] unstructured_text/IP_ADDRESS(L2) = '192.168.88.17'
+    [mysql/fintech_db.audit_trail.action_text #855] unstructured_text/IP_ADDRESS(L2) = '192.168.249.127'
+    [mysql/fintech_db.audit_trail.action_text #38] unstructured_text/IP_ADDRESS(L2) = '192.168.9.153'
+    [mysql/fintech_db.audit_trail.action_text #59] unstructured_text/IP_ADDRESS(L2) = '192.168.248.192'
+    [mysql/fintech_db.risk_assessment.risk_json #906] semi_structured/IP_ADDRESS(L2) = '10.148.164.173'
+    [mysql/ecommerce_db.login_log.log_text #489] unstructured_text/IP_ADDRESS(L2) = '10.138.106.110'
+    [mysql/fintech_db.audit_trail.action_text #86] unstructured_text/IP_ADDRESS(L2) = '172.28.131.220'
+
+  ━━━ MEDICAL_INSURANCE_NO (1070 条 FP) ━━━
+    [postgresql/healthcare_db.insurance_claims.claim_data #239] semi_structured/MEDICAL_INSURANCE_NO(L3) = 'YB68762220204223'
+    [postgresql/healthcare_db.insurance_claims.claim_data #438] semi_structured/MEDICAL_INSURANCE_NO(L3) = 'YB96431720182003'
+    [postgresql/healthcare_db.prescription_data.encoded_rx #789] encoded/MEDICAL_INSURANCE_NO(L3) = 'YB67390820267931'
+    [postgresql/healthcare_db.prescription_data.encoded_rx #972] encoded/MEDICAL_INSURANCE_NO(L3) = 'YB83178220181514'
+    [postgresql/healthcare_db.prescription_data.encoded_rx #64] encoded/MEDICAL_INSURANCE_NO(L3) = 'YB65297320182841'
+    [postgresql/healthcare_db.insurance_claims.claim_data #576] semi_structured/MEDICAL_INSURANCE_NO(L3) = 'YB71561520248646'
+    [postgresql/healthcare_db.insurance_claims.claim_data #136] semi_structured/MEDICAL_INSURANCE_NO(L3) = 'YB56587120186363'
+    [postgresql/healthcare_db.insurance_claims.claim_data #905] semi_structured/MEDICAL_INSURANCE_NO(L3) = 'YB41240420233406'
+    [postgresql/healthcare_db.prescription_data.encoded_rx #345] encoded/MEDICAL_INSURANCE_NO(L3) = 'YB11251420226481'
+    [postgresql/healthcare_db.prescription_data.encoded_rx #690] encoded/MEDICAL_INSURANCE_NO(L3) = 'YB22120020264297'
+
+  ━━━ VIN_CODE (971 条 FP) ━━━
+    [mysql/ecommerce_db.user_attachments.file_data #8] binary_blob/VIN_CODE(L3) = '6221883224902700U'
+    [postgresql/govservice_db.vehicle_records.vin #241] structured/VIN_CODE(L3) = 'LZYMEVSP5LE702987'
+    [postgresql/govservice_db.vehicle_records.vin #259] structured/VIN_CODE(L3) = 'LGJTUKVZ1GF786371'
+    [mysql/ecommerce_db.payment_detail.encoded_payload #598] encoded/VIN_CODE(L3) = '62251869106593027'
+    [mysql/ecommerce_db.user_attachments.file_data #65] binary_blob/VIN_CODE(L3) = '6221881777993851U'
+    [mysql/ecommerce_db.user_attachments.file_data #170] binary_blob/VIN_CODE(L3) = '6228486895099004M'
+    [mysql/fintech_db.credit_report.encoded_report #612] encoded/VIN_CODE(L3) = '62220036569139502'
+    [mysql/fintech_db.credit_report.encoded_report #686] encoded/VIN_CODE(L3) = '62260952068959904'
+    [mysql/fintech_db.credit_report.encoded_report #569] encoded/VIN_CODE(L3) = '62218878294977431'
+    [mysql/ecommerce_db.payment_detail.encoded_payload #569] encoded/VIN_CODE(L3) = '62270082298405516'
+
+  ━━━ SOCIAL_SECURITY_NO (907 条 FP) ━━━
+    [postgresql/govservice_db.citizen_registry.ss_no #931] structured/SOCIAL_SECURITY_NO(L3) = '川QD20258192'
+    [postgresql/govservice_db.citizen_registry.ss_no #114] structured/SOCIAL_SECURITY_NO(L3) = '京XO20266679'
+    [postgresql/govservice_db.citizen_registry.ss_no #564] structured/SOCIAL_SECURITY_NO(L3) = '京JZ20199092'
+    [postgresql/govservice_db.citizen_registry.ss_no #45] structured/SOCIAL_SECURITY_NO(L3) = '津NJ20181827'
+    [postgresql/govservice_db.citizen_registry.ss_no #376] structured/SOCIAL_SECURITY_NO(L3) = '浙EB20212893'
+    [postgresql/govservice_db.service_applications.app_json #486] semi_structured/SOCIAL_SECURITY_NO(L3) = '鄂WF20188483'
+    [postgresql/govservice_db.citizen_registry.ss_no #539] structured/SOCIAL_SECURITY_NO(L3) = '苏JV20241115'
+    [postgresql/govservice_db.citizen_registry.ss_no #970] structured/SOCIAL_SECURITY_NO(L3) = '津RH20195318'
+    [postgresql/govservice_db.citizen_registry.ss_no #782] structured/SOCIAL_SECURITY_NO(L3) = '京FX20262318'
+    [postgresql/govservice_db.citizen_registry.ss_no #644] structured/SOCIAL_SECURITY_NO(L3) = '津NV20261468'
+
+  ━━━ HOUSING_FUND_NO (750 条 FP) ━━━
+    [postgresql/govservice_db.citizen_registry.hf_no #404] structured/HOUSING_FUND_NO(L3) = 'NJ20237517647'
+    [postgresql/govservice_db.citizen_registry.hf_no #116] structured/HOUSING_FUND_NO(L3) = 'SZ20187165657'
+    [postgresql/govservice_db.citizen_registry.hf_no #245] structured/HOUSING_FUND_NO(L3) = 'GZ20180580608'
+    [postgresql/govservice_db.citizen_registry.hf_no #842] structured/HOUSING_FUND_NO(L3) = 'BJ20260777059'
+    [postgresql/govservice_db.citizen_registry.hf_no #195] structured/HOUSING_FUND_NO(L3) = 'SZ20235378148'
+    [postgresql/govservice_db.citizen_registry.hf_no #826] structured/HOUSING_FUND_NO(L3) = 'GZ20255580095'
+    [postgresql/govservice_db.citizen_registry.hf_no #622] structured/HOUSING_FUND_NO(L3) = 'BJ20197456012'
+    [postgresql/govservice_db.citizen_registry.hf_no #242] structured/HOUSING_FUND_NO(L3) = 'HZ20194571891'
+    [postgresql/govservice_db.citizen_registry.hf_no #696] structured/HOUSING_FUND_NO(L3) = 'SZ20191087717'
+    [postgresql/govservice_db.citizen_registry.hf_no #960] structured/HOUSING_FUND_NO(L3) = 'BJ20258586817'
+
+  ━━━ MEDICAL_RECORD_NO (743 条 FP) ━━━
+    [postgresql/healthcare_db.patient_master.medical_record_no #184] structured/MEDICAL_RECORD_NO(L3) = 'MR202444532'
+    [postgresql/healthcare_db.medical_images.img_data #100] binary_blob/MEDICAL_RECORD_NO(L3) = 'MR202238155'
+    [postgresql/healthcare_db.patient_master.medical_record_no #307] structured/MEDICAL_RECORD_NO(L3) = 'MR202394896'
+    [postgresql/healthcare_db.patient_master.medical_record_no #688] structured/MEDICAL_RECORD_NO(L3) = 'MR202670903'
+    [postgresql/healthcare_db.medical_images.img_data #154] binary_blob/MEDICAL_RECORD_NO(L3) = 'MR202167168'
+    [postgresql/healthcare_db.patient_master.medical_record_no #774] structured/MEDICAL_RECORD_NO(L3) = 'MR202537752'
+    [postgresql/healthcare_db.patient_master.medical_record_no #182] structured/MEDICAL_RECORD_NO(L3) = 'MR202272914'
+    [postgresql/healthcare_db.patient_master.medical_record_no #188] structured/MEDICAL_RECORD_NO(L3) = 'MR202364602'
+    [postgresql/healthcare_db.patient_master.medical_record_no #647] structured/MEDICAL_RECORD_NO(L3) = 'MR202512279'
+    [postgresql/healthcare_db.medical_images.img_data #58] binary_blob/MEDICAL_RECORD_NO(L3) = 'MR202256838'
+
+  ━━━ LICENSE_PLATE (401 条 FP) ━━━
+    [postgresql/govservice_db.vehicle_records.license_plate #334] structured/LICENSE_PLATE(L3) = '豫DTXP9K'
+    [postgresql/govservice_db.vehicle_records.license_plate #190] structured/LICENSE_PLATE(L3) = '皖G97EGV'
+    [postgresql/govservice_db.vehicle_records.license_plate #258] structured/LICENSE_PLATE(L3) = '云D4A6J5'
+    [postgresql/govservice_db.vehicle_records.license_plate #95] structured/LICENSE_PLATE(L3) = '贵UFBQYP'
+    [postgresql/govservice_db.vehicle_records.license_plate #111] structured/LICENSE_PLATE(L3) = '晋TV3UFF'
+    [postgresql/govservice_db.vehicle_records.license_plate #427] structured/LICENSE_PLATE(L3) = '粤VBCHFD'
+    [postgresql/govservice_db.vehicle_records.license_plate #197] structured/LICENSE_PLATE(L3) = '京V2U4WB'
+    [postgresql/govservice_db.vehicle_records.license_plate #404] structured/LICENSE_PLATE(L3) = '苏KQJKGR'
+    [postgresql/govservice_db.vehicle_records.license_plate #205] structured/LICENSE_PLATE(L3) = '川UA578Q'
+    [postgresql/govservice_db.vehicle_records.license_plate #380] structured/LICENSE_PLATE(L3) = '晋YC2HVQ'
+
+  ━━━ MAC_ADDRESS (275 条 FP) ━━━
+    [mysql/fintech_db.audit_trail.action_text #839] unstructured_text/MAC_ADDRESS(L2) = '72:a5:35:ef:a0:06'
+    [mysql/fintech_db.audit_trail.action_text #65] unstructured_text/MAC_ADDRESS(L2) = '69:91:32:67:1c:f7'
+    [mysql/fintech_db.audit_trail.action_text #141] unstructured_text/MAC_ADDRESS(L2) = 'bd:35:9a:24:68:2c'
+    [mysql/fintech_db.audit_trail.action_text #658] unstructured_text/MAC_ADDRESS(L2) = '13:06:14:43:80:df'
+    [mysql/fintech_db.audit_trail.action_text #426] unstructured_text/MAC_ADDRESS(L2) = '29:4c:7f:1d:96:5b'
+    [mysql/fintech_db.audit_trail.action_text #1068] unstructured_text/MAC_ADDRESS(L2) = 'b6:a3:34:45:9f:52'
+    [mysql/fintech_db.audit_trail.action_text #793] unstructured_text/MAC_ADDRESS(L2) = '2b:c1:cd:7d:7c:81'
+    [mysql/fintech_db.audit_trail.action_text #201] unstructured_text/MAC_ADDRESS(L2) = 'df:32:18:77:5e:1b'
+    [mysql/ecommerce_db.login_log.log_text #390] unstructured_text/MAC_ADDRESS(L2) = '03:07:d6:90:ef:11'
+    [mysql/fintech_db.audit_trail.action_text #1125] unstructured_text/MAC_ADDRESS(L2) = '21:52:2c:2a:2c:80'
+
+  ━━━ USCC (129 条 FP) ━━━
+    [postgresql/govservice_db.business_license.license_json #315] semi_structured/USCC(L3) = 'D13646845L5Y2QJC31'
+    [mysql/ecommerce_db.user_attachments.file_data #179] binary_blob/USCC(L3) = '62284828856512901U'
+    [mysql/fintech_db.credit_report.encoded_report #381] encoded/USCC(L3) = '3A6225184685888065'
+    [mysql/fintech_db.credit_report.encoded_report #304] encoded/USCC(L3) = '3A6229086604036419'
+    [mysql/ecommerce_db.user_attachments.file_data #186] binary_blob/USCC(L3) = '62220007067169960U'
+    [mysql/ecommerce_db.user_attachments.file_data #309] binary_blob/USCC(L3) = '62226235551839756U'
+    [postgresql/govservice_db.business_license.license_json #394] semi_structured/USCC(L3) = 'BC8599497AGFEC84A2'
+    [mysql/fintech_db.kyc_verification.doc_image #136] binary_blob/USCC(L3) = '62290855411063460U'
+    [postgresql/govservice_db.business_license.license_json #495] semi_structured/USCC(L3) = 'E9810548R4FD4MHGJU'
+    [postgresql/govservice_db.business_license.license_json #462] semi_structured/USCC(L3) = 'B24657927JC91HBUM3'
+
+  ━━━ PASSPORT (6 条 FP) ━━━
+    [postgresql/govservice_db.citizen_documents.doc_data #76] binary_blob/PASSPORT(L4) = 'P00711150'
+    [mysql/fintech_db.contract_archive.doc_image #235] binary_blob/PASSPORT(L4) = 'P92021616'
+    [mysql/fintech_db.kyc_verification.doc_image #153] binary_blob/PASSPORT(L4) = 'E89026920'
+    [mysql/fintech_db.kyc_verification.doc_image #172] binary_blob/PASSPORT(L4) = 'P11201212'
+    [mysql/fintech_db.contract_archive.doc_image #41] binary_blob/PASSPORT(L4) = 'P00122560'
+    [mysql/fintech_db.kyc_verification.doc_image #56] binary_blob/PASSPORT(L4) = 'E65675550'
+
+══════════════════════════════════════════════════════════════════════
+  6. 分层 F1(注意:相对 example 样本,不是真实 F1)
+══════════════════════════════════════════════════════════════════════
+  data_form                 TP    FP    FN    Prec  Recall      F1
+  structured               178 16267     0   0.011   1.000   0.021
+  unstructured_text        166 12275     0   0.013   1.000   0.026
+  semi_structured           95 12836     0   0.007   1.000   0.015
+  binary_blob               31  5382    41   0.006   0.431   0.011
+  encoded                   69  7356     0   0.009   1.000   0.018
+
+══════════════════════════════════════════════════════════════════════
+  7. 加权总 F1(按官方权重)
+══════════════════════════════════════════════════════════════════════
+  structured             F1=0.021  weight=0.1
+  semi_structured        F1=0.015  weight=0.2
+  encoded                F1=0.018  weight=0.2
+  unstructured_text      F1=0.026  weight=0.25
+  binary_blob            F1=0.011  weight=0.2
+  db_object              F1=0.000  weight=0.05
+
+  归一化加权 F1: 0.019
+  原始加权 F1:   0.018 (分母 0.95)
+
+══════════════════════════════════════════════════════════════════════
+  8. 等级准确率(TP 行里 level 填对的比例)
+══════════════════════════════════════════════════════════════════════
+  等级正确: 539/539  (100.0%)

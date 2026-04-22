@@ -53,13 +53,18 @@ MAX_SCAN_MINUTES = 30
 #   #2 OCR_POOL_SIZE 3→2,每 slot fraction 0.15→0.20(稳态优先)
 #   #3 DB_WORKERS=2 保持(第二轮 4 已实证会摊稀)
 #   #4 图片峰值削平:MAX_OCR_SIDE 960→800,PRE_SCALE 2000/1400→1600/1100
+# v7.1(2026-04-21 第五轮)450→540:
+#   实测 5 张 BLOB 表全部 450s 超时,最低只扫到 152 行(medical_images),
+#   FN 停在 41 条。加 20% 预算让关键路径(Thread B: fintech 2 BLOB 表 + govservice)
+#   仍落在 30min 内:60 + 2×540 + 60 + 540 = 1740s ≈ 29min,留 1min buffer。
+#   再往上就炸(600s → 32min)。
 # 预算说明:
 #   - 2 库并发、2 slot 吞吐;每 DB 实际占 1 slot,~1 call/s
-#   - 450s × 1 ≈ 450 行负载(NULL 过滤后命中率高)
+#   - 540s × 1 ≈ 540 行负载上限(受 BLOB_TABLE_MAX_ROWS=800 二次限制)
 #   - fintech 第 2 张 BLOB 表(contract_archive)在同一 DB 线程里串行,
-#     也有 450s 独占预算
-#   - 总 wall-clock ≈ 900s BLOB(fintech 串行 2 张) + 120s 非 BLOB = ~17min
-TABLE_TIMEOUT_SECONDS = 450
+#     也有 540s 独占预算
+#   - 关键路径 wall-clock ~29min,非关键路径(Thread A: ecommerce+healthcare)~20min
+TABLE_TIMEOUT_SECONDS = 540
 
 # ── 抽样扫描(大表保护) ────────────────────────────────────────
 # 超过该估算行数的表启用分层抽样

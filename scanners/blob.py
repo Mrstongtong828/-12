@@ -224,9 +224,9 @@ _OCR_LABEL_COLON = re.compile(
     r"发卡行|开户行|户籍|籍贯|民族|出生|身份)\s*[:\uff1a]\s*",
 )
 
-_OCR_CERT_PREFIX_SPACE = re.compile(r"\b(MR|YB|mR|mr|Mr)\s*(\d)")
-_OCR_MR_NORMALIZE = re.compile(r"\b[mM][rR](?=\d)")
-_OCR_YB_NORMALIZE = re.compile(r"\b[yY][bB](?=\d)")
+_OCR_CERT_PREFIX_SPACE = re.compile(r"(?<![A-Za-z])(MR|YB|mR|mr|Mr)\s*(\d)")
+_OCR_MR_NORMALIZE = re.compile(r"(?<![A-Za-z])[mM][rR](?=\d)")
+_OCR_YB_NORMALIZE = re.compile(r"(?<![A-Za-z])[yY][bB](?=\d)")
 _OCR_CJK_SPACE = re.compile(r"([\u4e00-\u9fa5])[ \t]{1,2}([\u4e00-\u9fa5])")
 _OCR_ID_X_SPACE = re.compile(r"(\d{17})\s+([XxNn])(?![\w\d])")
 
@@ -623,7 +623,9 @@ def _scan_digit_windows(text: str):
 
     # MEDICAL_RECORD_NO: MR + 9 位数字;扩展前缀容错 M→{M,m},R→{R,B,D,P,r,b,d,p}。
     # Why: OCR 常把 R 识成 B/D/P(字形相近);M 相对稳定。保留 M 首字母避免 FP 爆炸。
-    for m in re.finditer(r"\b[Mm][RrBbDdPp]\s*(\d{9})\b", text):
+    # 边界:用 (?<![A-Za-z]) / (?!\d) 替代 \b —— Python 3 的 \b 是 Unicode 模式,
+    #      CJK 也算 word char,中文邻接(如 "病历号:MR..." / "...张三") \b 不成立。
+    for m in re.finditer(r"(?<![A-Za-z])[Mm][RrBbDdPp]\s*(\d{9})(?!\d)", text):
         _add("MEDICAL_RECORD_NO", "MR" + m.group(1))
 
     return results

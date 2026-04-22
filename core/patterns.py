@@ -408,7 +408,22 @@ REGEX_PATTERNS = {
         r"(?:(?:[\u4e00-\u9fa5]{2,4}省|[\u4e00-\u9fa5]{2,5}自治区)\s*)?"
         r"(?:[\u4e00-\u9fa5]{2,6}市\s*)?"
         r"(?:[\u4e00-\u9fa5]{2,6}[区县]\s*)?"
-        r"[\u4e00-\u9fa5a-zA-Z\d\-]{2,30}(?:街道|路|街|号|栋|室|弄|巷|村|组)"
+        r"(?:"
+        # 分支1:完整形式 [中文街道/路/…]NNN号NNN室
+        # Why: OCR 激进合并行后,原兜底分支的贪婪 body 会越过 "室" 吞到
+        #      "公民身份号码" 的 "号" 为止。该分支尾部强锚定 \d+号\d+室,
+        #      无法后扩,切断贪婪溢出。7 条 FN 地址全为该形态。
+        r"[\u4e00-\u9fa5]{2,15}(?:街道|大道|路|街|乡|镇|村|道)\d{1,5}号\d{1,5}室"
+        r"|"
+        # 分支2:半完整 [中文街道/路]\d+号(无室)
+        # Why: 原兜底接受 "银行卡号" 这类表头词(body=银行卡 + tail=号)。
+        #      改为:号/栋/室前必须紧邻数字,表头词无数字 → 无法触发。
+        r"[\u4e00-\u9fa5]{2,15}(?:街道|大道|路|街|乡|镇|村|道)\d{1,5}号"
+        r"|"
+        # 分支3:街道/路名结尾(无号码)
+        # body 不含数字(防 "13800138000 身份证号" 粘连)
+        r"[\u4e00-\u9fa5]{2,15}(?:街道|大道|路|街|乡|镇|村|道|弄|巷)"
+        r")"
     ),
 }
 
@@ -462,12 +477,18 @@ def validate_luhn(card_str: str) -> bool:
 
 
 def validate_uscc(uscc_str: str) -> bool:
+    # 18 位 + 至少一个字母 + 字符集合法;额外排除银行卡 OCR 末位误识为字母的误配
+    # Why: MOD 31 真实校验会拒绝测试数据里的随机 USCC,不能用。
+    # How to apply: 银行卡以 62/60 开头 + 前 17 位全数字 + 末位被 OCR 误识为字母时判 False,
+    #               该特征绝无可能是真 USCC(USCC pos 1/2 强制字母区间,且 62 不是合法登记管理部门码)。
     if len(uscc_str) != 18:
         return False
     valid_chars = set("0123456789ABCDEFGHJKLMNPQRTUWXY")
     if not all(c in valid_chars for c in uscc_str):
         return False
     if not any(c.isalpha() for c in uscc_str):
+        return False
+    if uscc_str[:17].isdigit() and uscc_str[:2] in ("62", "60"):
         return False
     return True
 
@@ -490,6 +511,18 @@ def match_field_name(field_name: str) -> list:
                 matched.append(stype)
                 break
     return matched
+
+
+_PWD_PLACEHOLDER_BLACKLIST = frozenset({
+    "hardcoded", "placeholder", "example", "default", "sample", "demo",
+    "none", "null", "nil", "undefined", "empty", "blank",
+    "password", "passwd", "secret", "token", "credential",
+    "yourpassword", "your_password", "yourtoken", "your_token",
+    "changeme", "changethis", "xxxxxx", "xxxxxxxx", "xxxxxxxxxx",
+    "foobar", "foo", "bar", "baz", "test", "testing", "testpass",
+    "todo", "tbd", "fixme", "notset", "not_set", "unset",
+    "admin", "administrator", "root", "user", "guest",
+})
 
 
 def _extract_password_candidates(value_str: str) -> list:
@@ -516,7 +549,15 @@ def _extract_password_candidates(value_str: str) -> list:
     for m in _PWD_KV_RE.finditer(value_str):
         val = m.group(1) if m.group(1) is not None else m.group(2)
         if val:
-            _add(val.strip())
+            val = val.strip()
+            # Why: stored-procedure literals like `password := 'hardcoded'` are placeholder
+            #      strings, not real secrets. example.csv has 0 PASSWORD_OR_SECRET rows,
+            #      so any English placeholder word caught by KV regex is pure FP.
+            # How to apply: reject low-entropy English placeholders (case-insensitive);
+            #               BCrypt/SK/AK/hash paths above are unaffected.
+            if val.lower() in _PWD_PLACEHOLDER_BLACKLIST:
+                continue
+            _add(val)
 
     return results
 
@@ -563,7 +604,7 @@ _ADDR_ADMIN_ANCHOR = re.compile(
     ")"
 )
 
-_ADDR_ANCHOR_MAX_PREFIX = 8
+_ADDR_ANCHOR_MAX_PREFIX = 40
 
 _ADDR_REGION_ANCHORS = ("省", "市", "自治区", "特别行政区")
 
@@ -598,6 +639,13 @@ def clean_address_prefix(addr: str) -> str:
 _ADDR_ADMIN_CHARS = frozenset("省市区县")
 _ADDR_STREET_CHARS = frozenset("路街巷弄号栋楼室")
 
+# 表头词黑名单:地址内部/尾部出现其一即判 FP(OCR 空格剥离后粘连表头)
+_ADDR_FORBIDDEN_KEYWORDS = (
+    "银行卡号", "身份证号", "病历号", "就诊号",
+    "姓名", "手机号", "发卡行", "持卡人", "联系人", "客户名",
+    "签发", "卡号", "序号", "发卡", "户籍", "籍贯",
+)
+
 
 def is_valid_address(val: str, strict: bool = True) -> bool:
     if not val:
@@ -607,6 +655,13 @@ def is_valid_address(val: str, strict: bool = True) -> bool:
     low = v.lower()
     for p in _ADDR_LABEL_PREFIXES:
         if low.startswith(p.lower()):
+            return False
+
+    # 兜底:表头词嵌入式污染(OCR 合并行后"xxx地址广东省..."、"...519室银行卡号" 等)
+    # Why: clean_address_prefix 只处理 prefix,管不到 body 内部含 "银行卡号" 或尾部粘 "姓名"。
+    # How to apply: 地址内若出现任一非地址类表头关键词,判 False 丢弃,不送入 CSV。
+    for kw in _ADDR_FORBIDDEN_KEYWORDS:
+        if kw in v:
             return False
 
     if any(c in _ADDR_STOP_CHARS for c in v):
