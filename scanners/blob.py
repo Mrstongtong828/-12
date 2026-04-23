@@ -695,10 +695,12 @@ def _collect_findings_multipath(text, record_id, table_name, field_col_name,
             _emit(stype, val)
 
     # [兜底 ⑥] OCR 文本内部可能出现的 base64/hex 编码串(罕见但存在)
+    # Why 限制 token 数量: OCR 噪声可能产生大量无意义长英文 token，全部送递归解码代价高。
+    # 实测证件图片中编码型 BLOB 极少，限 10 个 token 够用且不拖慢主流程。
     try:
         from scanners.encoded import decode_recursive as _dec
-        # 对 OCR 文本中长度 > 40 的 token 逐个尝试解码
-        for token in re.findall(r"[A-Za-z0-9+/=]{40,}", text):
+        tokens = re.findall(r"[A-Za-z0-9+/=]{40,}", text)
+        for token in tokens[:10]:
             decoded, chain = _dec(token)
             if chain and decoded != token:
                 for stype, val in extract_sensitive_from_value(decoded):
@@ -793,14 +795,17 @@ def scan_blob_data(blob_bytes, record_id, table_name, field_col_name,
                     db_type, db_name,
                 ))
 
-    # [新增] 字节级文本兜底:BLOB 里可能混有明文字段(JSON/CSV/裸中文)
-    # 无论 OCR 是否成功,都跑一次字节级 utf-8/gbk 解码扫描,命中会并入结果。
-    byte_text = _bytes_as_text_fallback(data)
-    if byte_text:
-        _merge(_collect_findings_multipath(
-            byte_text, record_id, table_name, field_col_name,
-            db_type, db_name,
-        ))
+    # 字节级文本兜底:仅在以下两种情况触发，避免对图片字节白白跑一遍正则
+    #   ① OCR 没识别到任何内容（图片质量差或 OCR 被禁）
+    #   ② 非 image 类型（unknown / docx / xlsx 等走不到 OCR 路径）
+    ocr_produced_results = bool(findings)
+    if not ocr_produced_results:
+        byte_text = _bytes_as_text_fallback(data)
+        if byte_text:
+            _merge(_collect_findings_multipath(
+                byte_text, record_id, table_name, field_col_name,
+                db_type, db_name,
+            ))
 
     return findings
 

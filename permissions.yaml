@@ -1,0 +1,176 @@
+# ═══════════════════════════════════════════════════════════════════════
+# 数据库敏感字段识别与安全管控系统 — RBAC 权限配置
+# 对齐文档 docs/交付物/03_权限管控策略.md 中的权限矩阵
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── 角色定义 ─────────────────────────────────────────────────────────
+roles:
+  admin:
+    display_name: "系统管理员"
+    description: "拥有全部权限，负责系统配置、用户管理和安全审计"
+    permissions:
+      - scan            # 执行扫描任务
+      - export          # 导出识别结果
+      - view_plaintext  # 查看敏感数据明文
+      - audit           # 查看审计日志
+      - config          # 修改系统配置
+      - manage_users    # 创建/删除用户和角色
+
+  auditor:
+    display_name: "审计员"
+    description: "只读审计视角，可查看扫描统计但不可见明文"
+    permissions:
+      - scan            # 触发扫描（只读模式）
+      - export          # 导出脱敏后结果
+      - audit           # 查看审计日志
+    deny:
+      - view_plaintext  # 明确禁止：不可查看敏感明文
+      - config
+      - manage_users
+
+  operator:
+    display_name: "运维操作员"
+    description: "日常扫描和脱敏操作，可查看明文但不可修改系统配置"
+    permissions:
+      - scan
+      - export
+      - view_plaintext
+      - audit
+    deny:
+      - config
+      - manage_users
+
+  user:
+    display_name: "普通用户"
+    description: "无任何操作权限，仅可登录查看自己的访问记录"
+    permissions: []
+    deny:
+      - scan
+      - export
+      - view_plaintext
+      - audit
+      - config
+      - manage_users
+
+# ── 数据访问权限矩阵（按敏感等级） ───────────────────────────────────
+# access_policy: 角色 × 敏感等级 → 操作（plaintext / masked / deny）
+data_access:
+  admin:
+    L4: plaintext   # 高度敏感：身份证/银行卡/护照/军官证/密码
+    L3: plaintext   # 敏感：姓名/手机/邮箱/地址/车牌/证件号
+    L2: plaintext   # 内部：GPS/IP/MAC
+    L1: plaintext   # 公开
+
+  auditor:
+    L4: deny        # 高度敏感：禁止查看
+    L3: masked      # 敏感：显示脱敏值
+    L2: plaintext   # 内部：允许查看
+    L1: plaintext
+
+  operator:
+    L4: masked      # 高度敏感：显示脱敏值（audit log 记录每次访问）
+    L3: plaintext
+    L2: plaintext
+    L1: plaintext
+
+  user:
+    L4: deny
+    L3: deny
+    L2: deny
+    L1: deny
+
+# ── 动态脱敏规则 ─────────────────────────────────────────────────────
+# 当 access_policy = masked 时，应用对应的脱敏函数
+dynamic_masking:
+  CHINESE_NAME:         mask_chinese_name    # 保留姓氏，余遮蔽
+  PHONE_NUMBER:         mask_phone           # 138****5678
+  ID_CARD:              mask_id_card         # 440106********1234
+  BANK_CARD:            mask_bank_card       # 6222***********0123
+  EMAIL:                mask_email           # a****@qq.com
+  ADDRESS:              mask_address         # 广东省广州市****
+  PASSPORT:             mask_passport        # E******78
+  MILITARY_ID:          mask_military        # [MILITARY_REDACTED]
+  PASSWORD_OR_SECRET:   hash_secret          # [SHA256:abcdef1234567890...]
+  IP_ADDRESS:           mask_ip              # 192.168.*.*
+  MAC_ADDRESS:          mask_mac             # 76:c9:f9:**:**:**
+  GPS_COORDINATE:       mask_gps             # 23.*, 113.*
+  LICENSE_PLATE:        mask_license_plate   # 粤A*****
+  MEDICAL_RECORD_NO:    mask_medical_record  # MR2024*****
+  MEDICAL_INSURANCE_NO: mask_medical_insurance  # YB44************
+  SOCIAL_SECURITY_NO:   mask_social_security    # 粤SB********
+  HOUSING_FUND_NO:      mask_housing_fund        # GZ***********
+  VIN_CODE:             mask_vin             # LSV**********3456
+  USCC:                 mask_uscc            # 91440101******MPLE
+  BUSINESS_LICENSE_NO:  mask_business_license   # 440106*********
+
+# ── 数据库级访问控制 ─────────────────────────────────────────────────
+database_access:
+  ecommerce_db:
+    allowed_roles: [admin, auditor, operator]
+    restricted_tables:
+      - user_profile      # L4 字段集中，operator 需审计日志
+      - payment_detail    # 银行卡数据，访问受限
+  fintech_db:
+    allowed_roles: [admin, auditor, operator]
+    restricted_tables:
+      - kyc_verification  # 身份证+银行卡，高度敏感
+      - contract_archive
+  healthcare_db:
+    allowed_roles: [admin, auditor, operator]
+    restricted_tables:
+      - medical_images    # BLOB 图片，含身份证 OCR
+      - patient_records
+  govservice_db:
+    allowed_roles: [admin, auditor]   # 政务库 operator 无权限
+    restricted_tables:
+      - citizen_documents
+
+# ── 导出管控 ─────────────────────────────────────────────────────────
+export_policy:
+  admin:
+    approval_required: false
+    max_rows_per_export: unlimited
+    format: [csv, json]
+    audit_log: true
+
+  auditor:
+    approval_required: false
+    max_rows_per_export: 10000
+    format: [csv]
+    audit_log: true
+    masking_enforced: true    # 导出内容强制脱敏
+
+  operator:
+    approval_required: true   # 需要 admin 审批
+    approval_ttl_hours: 24
+    max_rows_per_export: 50000
+    format: [csv]
+    audit_log: true
+    masking_enforced:
+      L4: true   # L4 数据导出强制脱敏
+      L3: false
+      L2: false
+
+  user:
+    export_allowed: false
+
+# ── 审计日志策略 ─────────────────────────────────────────────────────
+audit_policy:
+  log_format: "%(timestamp)s [%(role)s:%(user)s] %(action)s %(resource)s"
+  log_path: "logs/audit.log"
+  rotate_daily: true
+  retention_days: 365
+  immutable: true             # WORM 模式，禁止覆盖
+  events_to_log:
+    - login
+    - logout
+    - scan_start
+    - scan_complete
+    - export_request
+    - export_approved
+    - export_denied
+    - view_plaintext_L4       # L4 明文查看必须记录
+    - config_change
+    - user_create
+    - user_delete
+    - role_change
