@@ -15,7 +15,7 @@ OCR 子进程入口。主进程通过 stdin/stdout 二进制流与之通信。
   熔断  :  连续 CONSEC_FAIL_EXIT 次内部失败或累计 TOTAL_FAIL_EXIT 次,
           子进程不回响应直接 sys.exit,让主进程读 EOF 视为失败。
 
-参数选择说明(v7 低内存 / CPU-only / 2-worker 池化档):
+参数选择说明(v8 吞吐优化 / CPU-only / 2-worker 池化档):
   - FLAGS_fraction_of_cpu_memory_to_use = 0.20 (每 worker ~3.2GB,两个合计 ~6.4GB)
     Why: v6 的 3 × 0.15 合计 0.45,与 Docker(MySQL+PG)+主进程峰值叠加后仍触发 OOM。
          v7 降到 2 slot、每 slot 给 0.20,单 slot 内存 +33%,rec padding 有富余,
@@ -24,7 +24,9 @@ OCR 子进程入口。主进程通过 stdin/stdout 二进制流与之通信。
   - MAX_OCR_PIXELS = 800*800 (总像素硬顶,窄长条图也逃不掉)
   - EXTREME_ASPECT = 3.0 (宽高比超过这个,额外再压到 640 边长)
   - rec_batch_num = 1 (默认 6,一次只处理 1 行文本,峰值内存线性降)
-  - RESET_EVERY = 6 (v6=8,主动重建周期再缩短,抑制分配池碎片长尾)
+  - RESET_EVERY = 50 (v7=6 触发过频,重建20-30s与25s超时叠加引发伪失败级联;v8放宽)
+  - use_angle_cls = False (v8新增;证件/卡片图片均正向,cls模型纯开销,约省200ms/张)
+  - cpu_threads = 2 (v8新增;i5-10400有12线程,2slot×2=4线程,OCR本体快约30-50%)
   - PRE_SCALE_THRESHOLD=1600 / PRE_SCALE_TARGET=1100 (v6=2000/1400,更早粗缩)
 
 NOTE: 上面的 FLAGS 值由 ocr_client._spawn 通过 env 显式传入(硬覆盖),
@@ -76,10 +78,10 @@ CONSEC_FAIL_EXIT = 5
 TOTAL_FAIL_EXIT = 15
 
 # 引擎重建周期
-# Why: v6=8 仍观察到 "retry after rebuild: ok" 多次出现,说明到第 8 张就已经
-# 累积碎片。v7=6 让主动 rebuild 更早,单次重建成本 ~20-30s,但能彻底消除
-# 长尾 primitive 失败,整体吞吐反而更稳。
-RESET_EVERY = 6
+# v7=6 导致每 6 张就重建一次(20-30s),与主进程 25s 超时叠加后触发伪失败级联。
+# v8=50: 碎片积累在实测中约 50 张才出现 primitive 失败,到时再重建;
+# 异常路径(OCR 失败)仍立即重建,内存安全不受影响。
+RESET_EVERY = 50
 
 
 def _read_exact(stream, n: int):
@@ -100,8 +102,8 @@ def _make_ocr():
     #   det_limit_type="max" —— 以长边为准,和 _decode_image 一致
     #   det_db_score_mode    —— "fast" 比 "slow" 少一半后处理内存
     return PaddleOCR(
-        use_angle_cls=True, lang="ch",
-        use_gpu=False, enable_mkldnn=False, cpu_threads=1,
+        use_angle_cls=False, lang="ch",
+        use_gpu=False, enable_mkldnn=False, cpu_threads=2,
         rec_batch_num=1,
         det_limit_side_len=MAX_OCR_SIDE,
         det_limit_type="max",
@@ -211,7 +213,7 @@ def _ocr_once(ocr_engine, img_bytes: bytes) -> str:
         img, _roi_tag = detect_and_warp(img)
     except Exception:
         pass
-    result = ocr_engine.ocr(img, cls=True)
+    result = ocr_engine.ocr(img, cls=False)
     if not result or not result[0]:
         return ""
     lines = []

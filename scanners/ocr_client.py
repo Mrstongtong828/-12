@@ -40,7 +40,7 @@ import atexit
 import queue
 
 OCR_POOL_SIZE = 2               # 并行 worker 数;16GB 机上 2×0.20 fraction 合计 ~6.4GB
-PER_IMAGE_TIMEOUT_SEC = 25      # 单图稳态推理超时
+PER_IMAGE_TIMEOUT_SEC = 38      # 单图稳态推理超时; 提升至 38s 给 RESET_EVERY 触发的偶发重建(20-30s)+OCR(2s)留余量
 SPAWN_TIMEOUT_SEC = 60          # 首次/重建引擎加载超时(三模型 ~30s)
 MAX_CONSEC_FAIL = 4             # 连续失败触发 kill+respawn 的阈值
 MAX_RESTART_CYCLES = 5          # v6=3 太严,slot 永久停用会腰斩 BLOB 吞吐
