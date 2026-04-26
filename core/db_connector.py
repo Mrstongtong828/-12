@@ -238,14 +238,15 @@ def stream_table_rows(conn, db_type: str, table_name: str, pk_col,
     仅在带 where_sql 时加 ORDER BY pk_col:让 BLOB 表超时前优先覆盖低 record_id,
     同时避免给普通表多加排序成本。
     """
-    FETCH_SIZE = 500  # [P3] 从 200 提升到 500，减少网络往返次数
+    FETCH_SIZE = 500
     where_clause = f" WHERE {where_sql}" if where_sql else ""
     use_order = bool(where_sql) and bool(pk_col)
     try:
         if db_type == "mysql":
             order_clause = f" ORDER BY `{pk_col}` ASC" if use_order else ""
             sql = f"SELECT * FROM `{table_name}`{where_clause}{order_clause}"
-            with conn.cursor() as cur:
+            # SSDictCursor：服务端无缓冲游标，行按需从服务器拉取，避免大表一次性载入内存
+            with conn.cursor(pymysql.cursors.SSDictCursor) as cur:
                 cur.execute(sql)
                 row_num = 0
                 while True:
@@ -260,8 +261,11 @@ def stream_table_rows(conn, db_type: str, table_name: str, pk_col,
         elif db_type == "postgresql":
             order_clause = f' ORDER BY "{pk_col}" ASC' if use_order else ""
             sql = f'SELECT * FROM "{table_name}"{where_clause}{order_clause}'
-            # [B6] 用 with 管理 cursor，确保生成器提前关闭（超时 break）时也能释放游标
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # 命名游标 → PostgreSQL 服务端游标，itersize 控制每批从服务器拉取的行数
+            cursor_name = f"scan_{table_name[:50]}"
+            with conn.cursor(cursor_name,
+                             cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.itersize = FETCH_SIZE
                 cur.execute(sql)
                 row_num = 0
                 while True:

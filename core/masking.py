@@ -14,7 +14,7 @@
     # → "138****5678"
 
     # 批量处理(用于研究报告对比展示)
-    batch_mask_csv("output/upload.csv", "output/masked.csv")
+    batch_mask_csv("output/upload.csv", "output/masked_report.csv")
 """
 import csv
 import hashlib
@@ -49,7 +49,7 @@ import re
 #   SOCIAL_SECURITY_NO   保留省份+字母 粤SB20240001 → 粤SB********
 #   HOUSING_FUND_NO      保留前2位    GZ20240001234 → GZ***********
 #   VIN_CODE             保留前3后4   LSVAU2180N2123456 → LSV**********3456
-#   USCC                 保留前8后4   91440101MA5EXAMPLE123 → 91440101********MPLE
+#   USCC                 保留前8后4   91440101MA5EXAMPLE123 → 91440101*********E123
 #   BUSINESS_LICENSE_NO  保留前6位    440106000123456 → 440106*********
 #   MILITARY_ID          全遮蔽                      → [MILITARY_REDACTED]
 

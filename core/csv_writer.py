@@ -10,8 +10,8 @@ COLUMNS = [
 EM_DASH = "\u2014"
 
 _PLACEHOLDER_RE = re.compile(r"^\[.+\]$")
-_NA_NUM_RE = re.compile(r"^N/A_\d+$")
-_SKIP_VALUES = {"", "none", "null", "n/a", "nan"}
+_NA_NUM_RE = re.compile(r"^N/A_\d+$", re.IGNORECASE)
+_SKIP_VALUES = {"none", "null", "n/a", "nan"}
 
 
 def _should_skip(value) -> bool:
@@ -31,7 +31,7 @@ def _should_skip(value) -> bool:
 
 class CSVWriter:
     def __init__(self, filepath: str = OUTPUT_CSV):
-        self._file = open(filepath, "w", encoding="utf-8", newline="\n")
+        self._file = open(filepath, "w", encoding="utf-8", newline="")
         self._writer = csv.DictWriter(
             self._file,
             fieldnames=COLUMNS,

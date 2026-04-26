@@ -69,7 +69,7 @@ def _find_card_quad(gray, cv2) -> Optional[object]:
     for c in contours:
         area = cv2.contourArea(c)
         if area < MIN_AREA_RATIO * total_area:
-            continue
+            break
         if area > MAX_AREA_RATIO * total_area:
             # 图本身就是裁好的卡,warp 会破坏 — 跳过这个候选继续试更小的
             continue
@@ -127,7 +127,7 @@ def detect_and_warp(img, *, max_long_edge: int = 1100) -> Tuple[object, str]:
     """
     # 任何分支异常都 passthrough,绝不抛给上游
     try:
-        import numpy as np  # noqa: F401
+        import numpy as np
         import cv2
     except Exception:
         return img, "passthrough"
